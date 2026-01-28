@@ -21,8 +21,10 @@ from __future__ import annotations
 import builtins
 import logging
 import os
-from collections import deque
+import time
+from collections import defaultdict, deque
 from pathlib import Path
+from threading import Lock
 
 import torch
 import torch.nn.functional as F  # noqa: N812
@@ -38,6 +40,207 @@ from .configuration_florence2 import Florence2Config
 from .configuration_xvla import XVLAConfig
 from .modeling_florence2 import Florence2ForConditionalGeneration
 from .soft_transformer import SoftPromptedTransformer
+
+
+class XVLATimingProfiler:
+    """
+    Profiler for measuring timing of different XVLA components.
+    Stores measurements and saves averages to a text file.
+
+    Components measured:
+    - vlm_vision_encoder: Time for image encoding via Florence2 vision tower
+    - vlm_text_embedding: Time for text token embedding
+    - vlm_multimodal_merge: Time for merging image and text features
+    - vlm_language_encoder: Time for language model encoder forward pass
+    - forward_vlm_total: Total VLM encoding time
+    - action_preprocessing: Time for noise addition and action space preprocessing
+    - policy_transformer_forward: Time for policy transformer inference
+    - loss_computation: Time for loss calculation
+    - forward_total: Total forward pass time
+    - denoising_loop_total: Total time for all denoising steps during inference
+    - denoising_step_N: Time for each individual denoising step
+    - denoising_step_avg: Average time per denoising step
+    - action_postprocessing: Time for action postprocessing
+    - generate_actions_total: Total action generation time
+    - batch_preparation: Time to prepare batch inputs
+    - select_action_total: Total time for action selection
+    """
+
+    def __init__(self, output_file: str = "xvla_timing_profile.txt", save_interval: int = 100):
+        self.output_file = output_file
+        self.save_interval = save_interval
+        self.timings: dict[str, list[float]] = defaultdict(list)
+        self.call_count = 0
+        self._lock = Lock()
+        self._cuda_available = torch.cuda.is_available()
+
+    def _sync_cuda(self) -> None:
+        if self._cuda_available:
+            torch.cuda.synchronize()
+
+    def start_timer(self) -> float:
+        self._sync_cuda()
+        return time.perf_counter()
+
+    def end_timer(self, start_time: float, component_name: str) -> float:
+        self._sync_cuda()
+        elapsed = (time.perf_counter() - start_time) * 1000  # Convert to ms
+        with self._lock:
+            self.timings[component_name].append(elapsed)
+            self.call_count += 1
+            if self.call_count % self.save_interval == 0:
+                self.save_to_file()
+        return elapsed
+
+    def record(self, component_name: str, elapsed_ms: float) -> None:
+        with self._lock:
+            self.timings[component_name].append(elapsed_ms)
+
+    def get_stats(self) -> dict[str, dict[str, float]]:
+        stats = {}
+        with self._lock:
+            for name, times in self.timings.items():
+                if times:
+                    stats[name] = {
+                        "count": len(times),
+                        "mean_ms": sum(times) / len(times),
+                        "min_ms": min(times),
+                        "max_ms": max(times),
+                        "total_ms": sum(times),
+                    }
+        return stats
+
+    def save_to_file(self) -> None:
+        stats = self.get_stats()
+        if not stats:
+            return
+
+        with open(self.output_file, "w") as f:
+            f.write("=" * 70 + "\n")
+            f.write("XVLA Timing Profile - Component Statistics\n")
+            f.write("=" * 70 + "\n\n")
+
+            # Sort by mean time descending
+            sorted_stats = sorted(stats.items(), key=lambda x: x[1]["mean_ms"], reverse=True)
+
+            for name, data in sorted_stats:
+                f.write(f"Component: {name}\n")
+                f.write(f"  Calls:    {data['count']}\n")
+                f.write(f"  Mean:     {data['mean_ms']:.4f} ms\n")
+                f.write(f"  Min:      {data['min_ms']:.4f} ms\n")
+                f.write(f"  Max:      {data['max_ms']:.4f} ms\n")
+                f.write(f"  Total:    {data['total_ms']:.4f} ms\n")
+                f.write("-" * 40 + "\n")
+
+            # Summary section
+            total_time = sum(s["total_ms"] for s in stats.values())
+            f.write("\n" + "=" * 70 + "\n")
+            f.write("Summary\n")
+            f.write("=" * 70 + "\n")
+            f.write(f"Total measured time: {total_time:.4f} ms\n")
+
+            # Percentage breakdown
+            f.write("\nTime breakdown (%):\n")
+            for name, data in sorted_stats:
+                pct = (data["total_ms"] / total_time * 100) if total_time > 0 else 0
+                f.write(f"  {name}: {pct:.2f}%\n")
+
+        logging.info(f"Saved XVLA timing profile to {self.output_file}")
+
+    def reset(self) -> None:
+        with self._lock:
+            self.timings.clear()
+            self.call_count = 0
+
+
+# Global profiler instance
+_xvla_profiler: XVLATimingProfiler | None = None
+
+
+def get_xvla_profiler(output_file: str = "xvla_timing_profile.txt") -> XVLATimingProfiler:
+    global _xvla_profiler
+    if _xvla_profiler is None:
+        _xvla_profiler = XVLATimingProfiler(output_file=output_file)
+    return _xvla_profiler
+
+
+class XVLAAttentionCollector:
+
+    def __init__(self, output_dir: str = "xvla_attention_data"):
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.attention_data: list[dict] = []
+        self._enabled = True  # Enabled by default
+        self._sample_counter = 0
+
+    def enable(self) -> None:
+        self._enabled = True
+
+    def disable(self) -> None:
+        self._enabled = False
+
+    def is_enabled(self) -> bool:
+        return self._enabled
+
+    def collect_from_model(self, model: "XVLAModel", sample_id: int | None = None) -> None:
+        if not self._enabled:
+            return
+
+        if sample_id is None:
+            sample_id = self._sample_counter
+            self._sample_counter += 1
+
+        attention_weights = {}
+
+        # Collect from policy transformer blocks
+        for layer_idx, block in enumerate(model.transformer.blocks):
+            attn_module = block.attn
+            weights = attn_module.get_last_attention_weights()
+            if weights is not None:
+                attention_weights[f"policy_layer_{layer_idx}"] = weights.numpy()
+
+        if attention_weights:
+            self.attention_data.append({
+                "sample_id": sample_id,
+                "attention_weights": attention_weights,
+            })
+
+    def save(self, filename: str | None = None) -> str:
+        import pickle
+
+        if filename is None:
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            filename = f"attention_data_{timestamp}.pkl"
+
+        filepath = self.output_dir / filename
+        with open(filepath, "wb") as f:
+            pickle.dump({
+                "attention_data": self.attention_data,
+                "num_samples": len(self.attention_data),
+            }, f)
+
+        logging.info(f"Saved {len(self.attention_data)} attention samples to {filepath}")
+        return str(filepath)
+
+    def reset(self) -> None:
+        self.attention_data.clear()
+        self._sample_counter = 0
+
+
+# Global attention collector instance
+_attention_collector: XVLAAttentionCollector | None = None
+
+
+def get_attention_collector(output_dir: str = "xvla_attention_data") -> XVLAAttentionCollector:
+    global _attention_collector
+    if _attention_collector is None:
+        _attention_collector = XVLAAttentionCollector(output_dir=output_dir)
+    return _attention_collector
+
+
+def set_xvla_profiler_output(output_file: str) -> None:
+    profiler = get_xvla_profiler()
+    profiler.output_file = output_file
 
 
 class XVLAModel(nn.Module):
@@ -163,6 +366,9 @@ class XVLAModel(nn.Module):
         """
         Encode text and multi-view images via Florence2 encoder.
         """
+        profiler = get_xvla_profiler()
+        t_vlm_total = profiler.start_timer()
+
         batch_size, num_views = pixel_values.shape[:2]
         flat_mask = image_mask.view(-1).to(dtype=torch.bool)
         flat_images = pixel_values.flatten(0, 1)
@@ -171,24 +377,42 @@ class XVLAModel(nn.Module):
             raise ValueError("At least one image view must be valid per batch.")
 
         valid_images = flat_images[flat_mask]
+
+        # Time vision encoding
+        t_vision = profiler.start_timer()
         valid_feats = self.vlm._encode_image(valid_images)
+        profiler.end_timer(t_vision, "vlm_vision_encoder")
+
         tokens_per_view, hidden_dim = valid_feats.shape[1:]
 
         image_features = valid_feats.new_zeros((batch_size * num_views, tokens_per_view, hidden_dim))
         image_features[flat_mask] = valid_feats
         image_features = image_features.view(batch_size, num_views, tokens_per_view, hidden_dim)
+
+        # Time text embedding
+        t_text_embed = profiler.start_timer()
         inputs_embeds = self.vlm.get_input_embeddings()(input_ids)
+        profiler.end_timer(t_text_embed, "vlm_text_embedding")
+
+        # Time multimodal merge
+        t_merge = profiler.start_timer()
         merged_embeds, attention_mask = self.vlm._merge_input_ids_with_image_features(
             image_features[:, 0],
             inputs_embeds,
         )
+        profiler.end_timer(t_merge, "vlm_multimodal_merge")
 
+        # Time language encoder
+        t_lang_enc = profiler.start_timer()
         enc_out = self.vlm.language_model.model.encoder(
             attention_mask=attention_mask,
             inputs_embeds=merged_embeds,
         )[0]
+        profiler.end_timer(t_lang_enc, "vlm_language_encoder")
 
         aux_visual_inputs = image_features[:, 1:].reshape(batch_size, -1, hidden_dim)
+
+        profiler.end_timer(t_vlm_total, "forward_vlm_total")
         return {"vlm_features": enc_out, "aux_visual_inputs": aux_visual_inputs}
 
     def forward(
@@ -203,11 +427,15 @@ class XVLAModel(nn.Module):
         """
         Forward pass for the XVLA model.
         """
+        profiler = get_xvla_profiler()
+        t_forward_total = profiler.start_timer()
+
         target_dtype = self._get_target_dtype()
         image_input = image_input.to(dtype=target_dtype)
         proprio = proprio.to(dtype=target_dtype)
         action = action.to(dtype=target_dtype)
 
+        # VLM encoding (detailed timing inside forward_vlm)
         enc = self.forward_vlm(input_ids, image_input, image_mask)
 
         batch_size = input_ids.shape[0]
@@ -216,9 +444,14 @@ class XVLAModel(nn.Module):
             + torch.arange(batch_size, device=input_ids.device, dtype=target_dtype) / batch_size
         ) % (1 - 1e-5)
 
+        # Time noise addition and preprocessing
+        t_preprocess = profiler.start_timer()
         action_noisy = torch.randn_like(action) * t.view(-1, 1, 1) + action * (1 - t).view(-1, 1, 1)
         proprio_m, action_noisy_m = self.action_space.preprocess(proprio, action_noisy)
+        profiler.end_timer(t_preprocess, "action_preprocessing")
 
+        # Time transformer forward
+        t_transformer = profiler.start_timer()
         pred_action = self.transformer(
             domain_id=domain_id,
             action_with_noise=action_noisy_m,
@@ -226,8 +459,15 @@ class XVLAModel(nn.Module):
             proprio=proprio_m,
             **enc,
         )
-        return self.action_space.compute_loss(pred_action, action)
+        profiler.end_timer(t_transformer, "policy_transformer_forward")
 
+        # Time loss computation
+        t_loss = profiler.start_timer()
+        loss = self.action_space.compute_loss(pred_action, action)
+        profiler.end_timer(t_loss, "loss_computation")
+
+        profiler.end_timer(t_forward_total, "forward_total")
+        return loss
     @torch.no_grad()
     def generate_actions(
         self,
@@ -240,10 +480,14 @@ class XVLAModel(nn.Module):
     ) -> torch.Tensor:
         self.eval()
 
+        profiler = get_xvla_profiler()
+        t_generate_total = profiler.start_timer()
+
         target_dtype = self._get_target_dtype()
         image_input = image_input.to(dtype=target_dtype)
         proprio = proprio.to(dtype=target_dtype)
 
+        # VLM encoding (detailed timing inside forward_vlm)
         enc = self.forward_vlm(input_ids, image_input, image_mask)
 
         batch_size = input_ids.shape[0]
@@ -253,7 +497,14 @@ class XVLAModel(nn.Module):
         action = torch.zeros_like(x1)
 
         steps = max(1, int(steps))
+
+        # Time denoising loop
+        t_denoising_total = profiler.start_timer()
+        denoising_step_times = []
+
         for i in range(steps, 0, -1):
+            t_step = profiler.start_timer()
+
             t = torch.full((batch_size,), i / steps, device=proprio.device, dtype=target_dtype)
             x_t = x1 * t.view(-1, 1, 1) + action * (1 - t).view(-1, 1, 1)
             proprio_m, x_t_m = self.action_space.preprocess(proprio, x_t)
@@ -264,7 +515,24 @@ class XVLAModel(nn.Module):
                 t=t,
                 **enc,
             )
-        return self.action_space.postprocess(action)
+
+            step_time = profiler.end_timer(t_step, f"denoising_step_{steps - i + 1}")
+            denoising_step_times.append(step_time)
+
+        profiler.end_timer(t_denoising_total, "denoising_loop_total")
+
+        # Record average denoising step time
+        if denoising_step_times:
+            avg_step_time = sum(denoising_step_times) / len(denoising_step_times)
+            profiler.record("denoising_step_avg", avg_step_time)
+
+        # Time postprocessing
+        t_postprocess = profiler.start_timer()
+        result = self.action_space.postprocess(action)
+        profiler.end_timer(t_postprocess, "action_postprocessing")
+
+        profiler.end_timer(t_generate_total, "generate_actions_total")
+        return result
 
 
 class XVLAPolicy(PreTrainedPolicy):
@@ -285,6 +553,47 @@ class XVLAPolicy(PreTrainedPolicy):
         self._queues = {
             ACTION: deque(maxlen=self.config.n_action_steps),
         }
+
+    def save_timing_profile(self, output_file: str | None = None) -> None:
+        profiler = get_xvla_profiler()
+        if output_file is not None:
+            profiler.output_file = output_file
+        profiler.save_to_file()
+
+    def reset_timing_profile(self) -> None:
+        profiler = get_xvla_profiler()
+        profiler.reset()
+
+    def get_timing_stats(self) -> dict[str, dict[str, float]]:
+        profiler = get_xvla_profiler()
+        return profiler.get_stats()
+
+    def enable_attention_collection(self, output_dir: str = "xvla_attention_data") -> None:
+        collector = get_attention_collector(output_dir)
+        collector.enable()
+        for block in self.model.transformer.blocks:
+            block.attn.set_return_attention(True)
+
+    def disable_attention_collection(self) -> None:
+        collector = get_attention_collector()
+        collector.disable()
+        for block in self.model.transformer.blocks:
+            block.attn.set_return_attention(False)
+
+    def collect_attention_weights(self, sample_id: int | None = None) -> None:
+        collector = get_attention_collector()
+        collector.collect_from_model(self.model, sample_id)
+
+    def save_attention_data(self, filename: str | None = None) -> str:
+        collector = get_attention_collector()
+        return collector.save(filename)
+
+    def reset_attention_collection(self) -> None:
+        collector = get_attention_collector()
+        collector.reset()
+
+    def get_attention_collector(self) -> XVLAAttentionCollector:
+        return get_attention_collector()
 
     def get_optim_params(self) -> dict:
         """Return trainable named parameters for optimization.
@@ -370,11 +679,16 @@ class XVLAPolicy(PreTrainedPolicy):
         return actions
 
     def _build_model_inputs(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
+        profiler = get_xvla_profiler()
+        t_build = profiler.start_timer()
+
         input_ids = batch[OBS_LANGUAGE_TOKENS]
         batch_size = input_ids.shape[0]
         images, image_mask = self._prepare_images(batch)
         domain_id = self._get_domain_id(batch, batch_size, images.device)
         proprio = self._prepare_state(batch, batch_size, images.device)
+
+        profiler.end_timer(t_build, "batch_preparation")
         return {
             "input_ids": input_ids,
             "image_input": images,
@@ -384,6 +698,9 @@ class XVLAPolicy(PreTrainedPolicy):
         }
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
+        profiler = get_xvla_profiler()
+        t_policy_forward = profiler.start_timer()
+
         inputs = self._build_model_inputs(batch)
         targets = self._prepare_action_targets(batch)
         losses = self.model(action=targets, **inputs)
@@ -391,29 +708,54 @@ class XVLAPolicy(PreTrainedPolicy):
 
         log_dict = {k: v.detach().item() for k, v in losses.items()}
         log_dict["loss"] = total_loss.detach().item()
+
+        profiler.end_timer(t_policy_forward, "policy_forward_total")
         return total_loss, log_dict
 
     def _get_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
+        profiler = get_xvla_profiler()
+        t_action_chunk = profiler.start_timer()
+
         inputs = self._build_model_inputs(batch)
         actions = self.model.generate_actions(**inputs, steps=self.config.num_denoising_steps)
+
+        # Automatically collect attention weights if enabled
+        collector = get_attention_collector()
+        if collector.is_enabled():
+            collector.collect_from_model(self.model)
+
+        profiler.end_timer(t_action_chunk, "get_action_chunk_total")
         return actions
 
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:  # noqa: ARG002
         self.eval()
+        profiler = get_xvla_profiler()
+        t_predict = profiler.start_timer()
+
         self._queues = populate_queues(self._queues, batch, exclude_keys=[ACTION])
-        return self._get_action_chunk(batch)
+        result = self._get_action_chunk(batch)
+
+        profiler.end_timer(t_predict, "predict_action_chunk_total")
+        return result
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:  # noqa: ARG002
         self.eval()
+        profiler = get_xvla_profiler()
+        t_select = profiler.start_timer()
+
         self._queues = populate_queues(self._queues, batch, exclude_keys=[ACTION])
 
         if len(self._queues[ACTION]) == 0:
+            t_generate = profiler.start_timer()
             actions = self._get_action_chunk(batch)
+            profiler.end_timer(t_generate, "action_generation_in_select")
             self._queues[ACTION].extend(actions.transpose(0, 1)[: self.config.n_action_steps])
 
-        return self._queues[ACTION].popleft()
+        result = self._queues[ACTION].popleft()
+        profiler.end_timer(t_select, "select_action_total")
+        return result
 
     @classmethod
     def from_pretrained(

@@ -123,6 +123,16 @@ class Attention(nn.Module):
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
+        # For attention weight extraction (enabled by default)
+        self._return_attention = True
+        self._last_attention_weights = None
+
+    def set_return_attention(self, value: bool) -> None:
+        self._return_attention = value
+
+    def get_last_attention_weights(self) -> torch.Tensor | None:
+        return self._last_attention_weights
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Parameters
@@ -144,19 +154,25 @@ class Attention(nn.Module):
         q, k, v = qkv.unbind(0)  # each: [batch_size, num_heads, seq_len, head_dim]
         q, k = self.q_norm(q), self.k_norm(k)
 
-        if self.fused_attn:
+        # Always compute attention weights manually if we need to capture them
+        if self._return_attention or not self.fused_attn:
+            q_scaled = q * self.scale
+            attn = q_scaled @ k.transpose(-2, -1)  # [batch_size, num_heads, seq_len, seq_len]
+            attn = attn.softmax(dim=-1)
+
+            if self._return_attention:
+                self._last_attention_weights = attn.detach().cpu()
+
+            attn = self.attn_drop(attn)
+            x = attn @ v  # [batch_size, num_heads, seq_len, head_dim]
+        else:
+            # Use fused attention (faster but no weights available)
             x = functional.scaled_dot_product_attention(
                 q,
                 k,
                 v,
                 dropout_p=self.attn_drop.p if self.training else 0.0,
             )  # [batch_size, num_heads, seq_len, head_dim]
-        else:
-            q = q * self.scale
-            attn = q @ k.transpose(-2, -1)  # [batch_size, num_heads, seq_len, seq_len]
-            attn = attn.softmax(dim=-1)
-            attn = self.attn_drop(attn)
-            x = attn @ v  # [batch_size, num_heads, seq_len, head_dim]
 
         x = x.transpose(1, 2).reshape(batch_size, seq_len, channels)  # [batch_size, seq_len, channels]
         x = self.proj(x)
