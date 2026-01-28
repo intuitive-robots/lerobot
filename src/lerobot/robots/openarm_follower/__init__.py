@@ -14,8 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .motors_bus import (
-    Motor,
-    MotorCalibration,
-    MotorNormMode,
-)
+from .config_openarm_follower import OpenArmFollowerConfig, OpenArmFollowerConfigBase
+from .openarm_follower import OpenArmFollower
+
+__all__ = ["OpenArmFollower", "OpenArmFollowerConfig", "OpenArmFollowerConfigBase"]
