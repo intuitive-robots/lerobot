@@ -9,7 +9,7 @@ from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
 
 
 @PreTrainedConfig.register_subclass("flower")
-class FlowerVLAConfig(SmolVLAConfig):
+class FlowerVLAConfig(PreTrainedConfig):
     def __init__(
         self,
         **kwargs,
