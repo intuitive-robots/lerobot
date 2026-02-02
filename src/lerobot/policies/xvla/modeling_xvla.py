@@ -24,7 +24,7 @@ import os
 import time
 from collections import defaultdict, deque
 from pathlib import Path
-from threading import Lock
+import threading
 
 import torch
 import torch.nn.functional as F  # noqa: N812
@@ -71,7 +71,7 @@ class XVLATimingProfiler:
         self.save_interval = save_interval
         self.timings: dict[str, list[float]] = defaultdict(list)
         self.call_count = 0
-        self._lock = Lock()
+        self._lock = threading.RLock()
         self._cuda_available = torch.cuda.is_available()
 
     def _sync_cuda(self) -> None:
@@ -165,13 +165,14 @@ def get_xvla_profiler(output_file: str = "xvla_timing_profile.txt") -> XVLATimin
 
 
 class XVLAAttentionCollector:
-
-    def __init__(self, output_dir: str = "xvla_attention_data"):
+    def __init__(self, output_dir: str = "xvla_attention_data", save_interval: int = 50):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.attention_data: list[dict] = []
         self._enabled = True  # Enabled by default
         self._sample_counter = 0
+        self.save_interval = save_interval
+        self._samples_since_save = 0
 
     def enable(self) -> None:
         self._enabled = True
@@ -184,6 +185,7 @@ class XVLAAttentionCollector:
 
     def collect_from_model(self, model: "XVLAModel", sample_id: int | None = None) -> None:
         if not self._enabled:
+            logging.debug("Attention collection is disabled, skipping.")
             return
 
         if sample_id is None:
@@ -191,22 +193,57 @@ class XVLAAttentionCollector:
             self._sample_counter += 1
 
         attention_weights = {}
+        layers_checked = 0
+        layers_with_weights = 0
 
         # Collect from policy transformer blocks
         for layer_idx, block in enumerate(model.transformer.blocks):
+            layers_checked += 1
             attn_module = block.attn
             weights = attn_module.get_last_attention_weights()
             if weights is not None:
-                attention_weights[f"policy_layer_{layer_idx}"] = weights.numpy()
+                layers_with_weights += 1
+                attention_weights[f"policy_layer_{layer_idx}"] = (
+                    weights.detach().cpu().to(torch.float32).numpy()
+                )
+
+        logging.debug(
+            f"Attention collection: checked {layers_checked} layers, "
+            f"found weights in {layers_with_weights} layers"
+        )
 
         if attention_weights:
-            self.attention_data.append({
-                "sample_id": sample_id,
-                "attention_weights": attention_weights,
-            })
+            self.attention_data.append(
+                {
+                    "sample_id": sample_id,
+                    "attention_weights": attention_weights,
+                }
+            )
+            self._samples_since_save += 1
+            logging.info(
+                f"Collected attention weights for sample {sample_id} "
+                f"({len(attention_weights)} layers, total samples: {len(self.attention_data)})"
+            )
+
+            # Auto-save at interval
+            if self.save_interval > 0 and self._samples_since_save >= self.save_interval:
+                self.save()
+                self._samples_since_save = 0
+        else:
+            logging.warning(
+                f"No attention weights found for sample {sample_id}. "
+                f"Make sure _return_attention is True in Attention modules."
+            )
 
     def save(self, filename: str | None = None) -> str:
         import pickle
+
+        if not self.attention_data:
+            logging.warning(
+                "No attention data to save. Make sure attention collection is enabled "
+                "and the model has been run with _return_attention=True in Attention modules."
+            )
+            return ""
 
         if filename is None:
             timestamp = time.strftime("%Y%m%d_%H%M%S")
@@ -214,10 +251,13 @@ class XVLAAttentionCollector:
 
         filepath = self.output_dir / filename
         with open(filepath, "wb") as f:
-            pickle.dump({
-                "attention_data": self.attention_data,
-                "num_samples": len(self.attention_data),
-            }, f)
+            pickle.dump(
+                {
+                    "attention_data": self.attention_data,
+                    "num_samples": len(self.attention_data),
+                },
+                f,
+            )
 
         logging.info(f"Saved {len(self.attention_data)} attention samples to {filepath}")
         return str(filepath)
@@ -225,6 +265,7 @@ class XVLAAttentionCollector:
     def reset(self) -> None:
         self.attention_data.clear()
         self._sample_counter = 0
+        self._samples_since_save = 0
 
 
 # Global attention collector instance
@@ -468,6 +509,7 @@ class XVLAModel(nn.Module):
 
         profiler.end_timer(t_forward_total, "forward_total")
         return loss
+
     @torch.no_grad()
     def generate_actions(
         self,
