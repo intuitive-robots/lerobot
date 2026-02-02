@@ -299,39 +299,60 @@ class XVLAAttentionCollector:
             return
 
         if not self._has_matplotlib:
+            logging.warning("matplotlib not available, cannot create heatmaps.")
             return
 
         self._call_count += 1
 
-        # Only save at interval (like timing profiler)
-        if self.save_interval > 0 and self._call_count % self.save_interval != 0:
+        # Save on first call (call_count=1) and then every save_interval calls
+        should_save = (self._call_count == 1) or (
+            self.save_interval > 0 and self._call_count % self.save_interval == 0
+        )
+        if not should_save:
             return
 
         if sample_id is None:
             sample_id = self._sample_counter
             self._sample_counter += 1
 
+        logging.info(f"Collecting attention weights (call {self._call_count}, sample {sample_id})...")
+
         attention_weights = {}
         layers_with_weights = 0
+        layers_without_weights = 0
 
         # Collect from policy transformer blocks
         for layer_idx, block in enumerate(model.transformer.blocks):
             attn_module = block.attn
+
+            # Check if attention return is enabled
+            if not getattr(attn_module, "_return_attention", False):
+                logging.debug(f"Layer {layer_idx}: _return_attention is False")
+
             weights = attn_module.get_last_attention_weights()
             if weights is not None:
                 layers_with_weights += 1
-                attention_weights[f"policy_layer_{layer_idx}"] = (
-                    weights.detach().cpu().to(torch.float32).numpy()
-                )
+                # Weights should already be float32 from soft_transformer, but ensure it
+                if weights.dtype != torch.float32:
+                    weights = weights.float()
+                attention_weights[f"policy_layer_{layer_idx}"] = weights.numpy()
+            else:
+                layers_without_weights += 1
+                logging.debug(f"Layer {layer_idx}: weights is None")
 
         if not attention_weights:
             logging.warning(
                 f"No attention weights found for sample {sample_id}. "
+                f"Checked {layers_with_weights + layers_without_weights} layers, "
+                f"{layers_without_weights} had None weights. "
                 f"Make sure _return_attention is True in Attention modules."
             )
             return
 
-        logging.info(f"Creating attention heatmaps for sample {sample_id} ({layers_with_weights} layers)")
+        logging.info(
+            f"Creating attention heatmaps for sample {sample_id} "
+            f"({layers_with_weights} layers with weights, output: {self.output_dir})"
+        )
 
         timestamp = time.strftime("%Y%m%d_%H%M%S")
 
@@ -690,6 +711,10 @@ class XVLAPolicy(PreTrainedPolicy):
         proprio_dim = config.max_state_dim if config.use_proprio else 0
         self.model = XVLAModel(config=config, florence_config=florence_config, proprio_dim=proprio_dim)
         self.reset()
+
+        # Enable attention return by default for all transformer blocks
+        for block in self.model.transformer.blocks:
+            block.attn.set_return_attention(True)
 
     def reset(self) -> None:
         self._queues = {
