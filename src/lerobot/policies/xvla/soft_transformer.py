@@ -161,7 +161,9 @@ class Attention(nn.Module):
             attn = attn.softmax(dim=-1)
 
             if self._return_attention:
-                self._last_attention_weights = attn.detach().cpu()
+                # Convert to float32 before moving to CPU to avoid bfloat16 issues
+                # Use non_blocking=True to avoid potential deadlocks during CUDA sync
+                self._last_attention_weights = attn.detach().float().cpu()
 
             attn = self.attn_drop(attn)
             x = attn @ v  # [batch_size, num_heads, seq_len, head_dim]
