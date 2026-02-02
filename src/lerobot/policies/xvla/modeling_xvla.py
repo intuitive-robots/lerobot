@@ -85,11 +85,15 @@ class XVLATimingProfiler:
     def end_timer(self, start_time: float, component_name: str) -> float:
         self._sync_cuda()
         elapsed = (time.perf_counter() - start_time) * 1000  # Convert to ms
+        should_save = False
         with self._lock:
             self.timings[component_name].append(elapsed)
             self.call_count += 1
             if self.call_count % self.save_interval == 0:
-                self.save_to_file()
+                should_save = True
+        # Save outside lock to avoid blocking other threads during I/O
+        if should_save:
+            self.save_to_file()
         return elapsed
 
     def record(self, component_name: str, elapsed_ms: float) -> None:
@@ -99,15 +103,17 @@ class XVLATimingProfiler:
     def get_stats(self) -> dict[str, dict[str, float]]:
         stats = {}
         with self._lock:
-            for name, times in self.timings.items():
-                if times:
-                    stats[name] = {
-                        "count": len(times),
-                        "mean_ms": sum(times) / len(times),
-                        "min_ms": min(times),
-                        "max_ms": max(times),
-                        "total_ms": sum(times),
-                    }
+            # Make a copy of timings to avoid holding lock during computation
+            timings_copy = {k: list(v) for k, v in self.timings.items()}
+        for name, times in timings_copy.items():
+            if times:
+                stats[name] = {
+                    "count": len(times),
+                    "mean_ms": sum(times) / len(times),
+                    "min_ms": min(times),
+                    "max_ms": max(times),
+                    "total_ms": sum(times),
+                }
         return stats
 
     def save_to_file(self) -> None:
@@ -165,14 +171,29 @@ def get_xvla_profiler(output_file: str = "xvla_timing_profile.txt") -> XVLATimin
 
 
 class XVLAAttentionCollector:
-    def __init__(self, output_dir: str = "xvla_attention_data", save_interval: int = 50):
+    """
+    Collector that creates attention heatmap visualizations directly during inference.
+    Heatmaps are saved at the same interval as timing profiles.
+    """
+
+    def __init__(self, output_dir: str = ".", save_interval: int = 100):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.attention_data: list[dict] = []
         self._enabled = True  # Enabled by default
         self._sample_counter = 0
         self.save_interval = save_interval
-        self._samples_since_save = 0
+        self._call_count = 0
+        self._has_matplotlib = self._check_matplotlib()
+
+    def _check_matplotlib(self) -> bool:
+        try:
+            import matplotlib
+
+            matplotlib.use("Agg")  # Non-interactive backend for saving
+            return True
+        except ImportError:
+            logging.warning("matplotlib not installed. Attention heatmaps will not be generated.")
+            return False
 
     def enable(self) -> None:
         self._enabled = True
@@ -183,9 +204,107 @@ class XVLAAttentionCollector:
     def is_enabled(self) -> bool:
         return self._enabled
 
+    def set_output_dir(self, output_dir: str) -> None:
+        """Set output directory (should match timing profile location)."""
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
+    def _aggregate_heads(self, attention, method: str = "mean"):
+        """Aggregate attention weights across heads."""
+        if attention.ndim == 4:  # [batch, heads, seq, seq]
+            attention = attention[0]  # Take first batch
+        if attention.ndim == 3:  # [heads, seq, seq]
+            if method == "mean":
+                return attention.mean(axis=0)
+            elif method == "max":
+                return attention.max(axis=0)
+        return attention
+
+    def _create_heatmap(
+        self,
+        attention,
+        title: str,
+        output_path: Path,
+    ) -> None:
+        """Create and save a single attention heatmap."""
+        if not self._has_matplotlib:
+            return
+
+        import matplotlib.pyplot as plt
+
+        fig, ax = plt.subplots(figsize=(10, 8))
+        im = ax.imshow(attention, cmap="viridis", aspect="auto")
+        plt.colorbar(im, ax=ax)
+        ax.set_title(title, fontsize=12)
+        ax.set_xlabel("Key Position", fontsize=10)
+        ax.set_ylabel("Query Position", fontsize=10)
+        plt.tight_layout()
+        plt.savefig(output_path, dpi=100, bbox_inches="tight")
+        plt.close(fig)
+
+    def _create_layer_comparison(
+        self,
+        attention_by_layer: dict,
+        sample_id: int,
+        output_path: Path,
+    ) -> None:
+        """Create a grid comparing attention across all layers."""
+        if not self._has_matplotlib:
+            return
+
+        import matplotlib.pyplot as plt
+        import numpy as np
+
+        layer_names = sorted(attention_by_layer.keys())
+        num_layers = len(layer_names)
+
+        if num_layers == 0:
+            return
+
+        cols = min(6, num_layers)
+        rows = (num_layers + cols - 1) // cols
+
+        fig, axes = plt.subplots(rows, cols, figsize=(cols * 2.5, rows * 2.5))
+
+        if num_layers == 1:
+            axes = np.array([[axes]])
+        elif rows == 1:
+            axes = axes.reshape(1, -1)
+        elif cols == 1:
+            axes = axes.reshape(-1, 1)
+
+        for idx, layer_name in enumerate(layer_names):
+            row, col = idx // cols, idx % cols
+            ax = axes[row, col]
+            attn = self._aggregate_heads(attention_by_layer[layer_name])
+            ax.imshow(attn, cmap="viridis", aspect="auto")
+            layer_num = layer_name.replace("policy_layer_", "L")
+            ax.set_title(layer_num, fontsize=8)
+            ax.set_xticks([])
+            ax.set_yticks([])
+
+        # Hide unused subplots
+        for idx in range(num_layers, rows * cols):
+            row, col = idx // cols, idx % cols
+            axes[row, col].axis("off")
+
+        fig.suptitle(f"Sample {sample_id} - Attention Across Layers", fontsize=12)
+        plt.tight_layout()
+        plt.savefig(output_path, dpi=100, bbox_inches="tight")
+        plt.close(fig)
+
     def collect_from_model(self, model: "XVLAModel", sample_id: int | None = None) -> None:
         if not self._enabled:
             logging.debug("Attention collection is disabled, skipping.")
+            return
+
+        if not self._has_matplotlib:
+            return
+
+        self._call_count += 1
+
+        # Only save at interval (like timing profiler)
+        if self.save_interval > 0 and self._call_count % self.save_interval != 0:
             return
 
         if sample_id is None:
@@ -193,12 +312,10 @@ class XVLAAttentionCollector:
             self._sample_counter += 1
 
         attention_weights = {}
-        layers_checked = 0
         layers_with_weights = 0
 
         # Collect from policy transformer blocks
         for layer_idx, block in enumerate(model.transformer.blocks):
-            layers_checked += 1
             attn_module = block.attn
             weights = attn_module.get_last_attention_weights()
             if weights is not None:
@@ -207,72 +324,55 @@ class XVLAAttentionCollector:
                     weights.detach().cpu().to(torch.float32).numpy()
                 )
 
-        logging.debug(
-            f"Attention collection: checked {layers_checked} layers, "
-            f"found weights in {layers_with_weights} layers"
-        )
-
-        if attention_weights:
-            self.attention_data.append(
-                {
-                    "sample_id": sample_id,
-                    "attention_weights": attention_weights,
-                }
-            )
-            self._samples_since_save += 1
-            logging.info(
-                f"Collected attention weights for sample {sample_id} "
-                f"({len(attention_weights)} layers, total samples: {len(self.attention_data)})"
-            )
-
-            # Auto-save at interval
-            if self.save_interval > 0 and self._samples_since_save >= self.save_interval:
-                self.save()
-                self._samples_since_save = 0
-        else:
+        if not attention_weights:
             logging.warning(
                 f"No attention weights found for sample {sample_id}. "
                 f"Make sure _return_attention is True in Attention modules."
             )
+            return
+
+        logging.info(f"Creating attention heatmaps for sample {sample_id} ({layers_with_weights} layers)")
+
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+
+        # Create layer comparison heatmap (all layers in one image)
+        comparison_path = self.output_dir / f"attention_sample_{sample_id}_{timestamp}.png"
+        self._create_layer_comparison(attention_weights, sample_id, comparison_path)
+        logging.info(f"Saved attention heatmap to {comparison_path}")
+
+        # Optionally create individual layer heatmaps for first, middle, last layers
+        key_layers = self._get_key_layers(list(attention_weights.keys()))
+        for layer_name in key_layers:
+            attn = self._aggregate_heads(attention_weights[layer_name])
+            layer_path = self.output_dir / f"attention_sample_{sample_id}_{layer_name}_{timestamp}.png"
+            self._create_heatmap(
+                attn,
+                f"Sample {sample_id} - {layer_name}",
+                layer_path,
+            )
+
+    def _get_key_layers(self, layer_names: list) -> list:
+        """Get first, middle, and last layer names."""
+        if len(layer_names) <= 3:
+            return layer_names
+        sorted_names = sorted(layer_names)
+        return [sorted_names[0], sorted_names[len(sorted_names) // 2], sorted_names[-1]]
 
     def save(self, filename: str | None = None) -> str:
-        import pickle
-
-        if not self.attention_data:
-            logging.warning(
-                "No attention data to save. Make sure attention collection is enabled "
-                "and the model has been run with _return_attention=True in Attention modules."
-            )
-            return ""
-
-        if filename is None:
-            timestamp = time.strftime("%Y%m%d_%H%M%S")
-            filename = f"attention_data_{timestamp}.pkl"
-
-        filepath = self.output_dir / filename
-        with open(filepath, "wb") as f:
-            pickle.dump(
-                {
-                    "attention_data": self.attention_data,
-                    "num_samples": len(self.attention_data),
-                },
-                f,
-            )
-
-        logging.info(f"Saved {len(self.attention_data)} attention samples to {filepath}")
-        return str(filepath)
+        """Legacy method - now heatmaps are saved directly during collection."""
+        logging.info("Attention heatmaps are saved directly during collection, no separate save needed.")
+        return str(self.output_dir)
 
     def reset(self) -> None:
-        self.attention_data.clear()
         self._sample_counter = 0
-        self._samples_since_save = 0
+        self._call_count = 0
 
 
 # Global attention collector instance
 _attention_collector: XVLAAttentionCollector | None = None
 
 
-def get_attention_collector(output_dir: str = "xvla_attention_data") -> XVLAAttentionCollector:
+def get_attention_collector(output_dir: str = ".") -> XVLAAttentionCollector:
     global _attention_collector
     if _attention_collector is None:
         _attention_collector = XVLAAttentionCollector(output_dir=output_dir)
@@ -600,6 +700,9 @@ class XVLAPolicy(PreTrainedPolicy):
         profiler = get_xvla_profiler()
         if output_file is not None:
             profiler.output_file = output_file
+            # Also update attention collector to use same directory
+            collector = get_attention_collector()
+            collector.set_output_dir(str(Path(output_file).parent))
         profiler.save_to_file()
 
     def reset_timing_profile(self) -> None:
@@ -610,8 +713,21 @@ class XVLAPolicy(PreTrainedPolicy):
         profiler = get_xvla_profiler()
         return profiler.get_stats()
 
-    def enable_attention_collection(self, output_dir: str = "xvla_attention_data") -> None:
+    def enable_attention_collection(self, output_dir: str | None = None) -> None:
+        """
+        Enable attention heatmap collection.
+
+        Args:
+            output_dir: Directory to save heatmaps. If None, uses same directory
+                       as timing profile output file.
+        """
+        if output_dir is None:
+            # Use same directory as timing profiler
+            profiler = get_xvla_profiler()
+            output_dir = str(Path(profiler.output_file).parent)
+
         collector = get_attention_collector(output_dir)
+        collector.set_output_dir(output_dir)
         collector.enable()
         for block in self.model.transformer.blocks:
             block.attn.set_return_attention(True)
