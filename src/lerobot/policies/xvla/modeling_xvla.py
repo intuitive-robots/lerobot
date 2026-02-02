@@ -189,7 +189,6 @@ class XVLAAttentionCollector:
         self.save_interval = save_interval
         self._call_count = 0
         self._has_matplotlib = self._check_matplotlib()
-        self._denoising_step_weights: list[dict] = []
         self._collecting_this_sample = False
 
         # Sequence layout info (will be set during collection)
@@ -249,7 +248,6 @@ class XVLAAttentionCollector:
         self,
         attention_by_layer: dict,
         sample_id: int,
-        step_idx: int | None = None,
         timestamp: str = "",
     ) -> None:
         """Create semantic attention heatmaps showing different attention patterns."""
@@ -262,11 +260,7 @@ class XVLAAttentionCollector:
         # Calculate segment boundaries
         a_end = self._num_actions
         vlm_end = a_end + self._num_vlm_tokens
-        aux_end = vlm_end + self._num_aux_tokens
         total_context = self._num_vlm_tokens + self._num_aux_tokens + self._num_soft_prompts
-
-        step_suffix = f"_step{step_idx}" if step_idx is not None else "_final"
-        step_title = f"Step {step_idx}" if step_idx is not None else "Final"
 
         # Aggregate across all layers (use later layers for more semantic attention)
         layer_names = sorted(attention_by_layer.keys())
@@ -278,36 +272,28 @@ class XVLAAttentionCollector:
         attn = self._aggregate_heads(attention_by_layer[last_layer])
 
         # 1. Action Self-Attention (Decoder Self-Attention)
-        # How action tokens attend to each other
         if a_end > 0:
             action_self_attn = attn[:a_end, :a_end]
             fig, ax = plt.subplots(figsize=(8, 6))
             im = ax.imshow(action_self_attn, cmap="viridis", aspect="auto")
             plt.colorbar(im, ax=ax)
-            ax.set_title(
-                f"Sample {sample_id} {step_title} - Action Self-Attention\n(How action steps attend to each other)",
-                fontsize=11,
-            )
+            ax.set_title(f"Sample {sample_id} - Action Self-Attention", fontsize=11)
             ax.set_xlabel("Key: Action Step", fontsize=10)
             ax.set_ylabel("Query: Action Step", fontsize=10)
             ax.set_xticks(range(0, a_end, max(1, a_end // 10)))
             ax.set_yticks(range(0, a_end, max(1, a_end // 10)))
             plt.tight_layout()
-            path = self.output_dir / f"attention_{sample_id}{step_suffix}_1_action_self_{timestamp}.png"
+            path = self.output_dir / f"attention_{sample_id}_1_action_self_{timestamp}.png"
             plt.savefig(path, dpi=120, bbox_inches="tight")
             plt.close(fig)
 
         # 2. Action→Context Cross-Attention
-        # How actions attend to VLM features, aux visual, and soft prompts
         if a_end > 0 and total_context > 0:
             action_to_context = attn[:a_end, a_end:]
             fig, ax = plt.subplots(figsize=(12, 6))
             im = ax.imshow(action_to_context, cmap="viridis", aspect="auto")
             plt.colorbar(im, ax=ax)
-            ax.set_title(
-                f"Sample {sample_id} {step_title} - Action→Context Cross-Attention\n(How actions use visual and prompt information)",
-                fontsize=11,
-            )
+            ax.set_title(f"Sample {sample_id} - Action→Context Cross-Attention", fontsize=11)
             ax.set_xlabel("Key: Context (VLM | Aux Visual | Soft Prompts)", fontsize=10)
             ax.set_ylabel("Query: Action Step", fontsize=10)
 
@@ -358,20 +344,17 @@ class XVLAAttentionCollector:
             )
 
             plt.tight_layout()
-            path = self.output_dir / f"attention_{sample_id}{step_suffix}_2_action_to_context_{timestamp}.png"
+            path = self.output_dir / f"attention_{sample_id}_2_action_to_context_{timestamp}.png"
             plt.savefig(path, dpi=120, bbox_inches="tight")
             plt.close(fig)
 
-        # 3. Context Self-Attention (VLM + Aux + Prompts internal attention)
+        # 3. Context Self-Attention
         if total_context > 0:
             context_self_attn = attn[a_end:, a_end:]
             fig, ax = plt.subplots(figsize=(10, 8))
             im = ax.imshow(context_self_attn, cmap="viridis", aspect="auto")
             plt.colorbar(im, ax=ax)
-            ax.set_title(
-                f"Sample {sample_id} {step_title} - Context Self-Attention\n(VLM, Visual, Prompt internal relationships)",
-                fontsize=11,
-            )
+            ax.set_title(f"Sample {sample_id} - Context Self-Attention", fontsize=11)
             ax.set_xlabel("Key: Context Tokens", fontsize=10)
             ax.set_ylabel("Query: Context Tokens", fontsize=10)
 
@@ -395,11 +378,11 @@ class XVLAAttentionCollector:
                 )
 
             plt.tight_layout()
-            path = self.output_dir / f"attention_{sample_id}{step_suffix}_3_context_self_{timestamp}.png"
+            path = self.output_dir / f"attention_{sample_id}_3_context_self_{timestamp}.png"
             plt.savefig(path, dpi=120, bbox_inches="tight")
             plt.close(fig)
 
-        # 4. Full Annotated Attention Matrix (all layers overview)
+        # 4. Full Annotated Attention Matrix
         fig, axes = plt.subplots(2, 3, figsize=(15, 10))
         axes = axes.flatten()
 
@@ -430,16 +413,109 @@ class XVLAAttentionCollector:
         for ax_idx in range(len(selected_indices), 6):
             axes[ax_idx].axis("off")
 
-        fig.suptitle(
-            f"Sample {sample_id} {step_title} - Full Attention (Red=Action boundary, Cyan=VLM boundary)",
-            fontsize=12,
-        )
+        fig.suptitle(f"Sample {sample_id} - Full Attention Matrix", fontsize=12)
         plt.tight_layout()
-        path = self.output_dir / f"attention_{sample_id}{step_suffix}_4_full_annotated_{timestamp}.png"
+        path = self.output_dir / f"attention_{sample_id}_4_full_annotated_{timestamp}.png"
         plt.savefig(path, dpi=100, bbox_inches="tight")
         plt.close(fig)
 
-        logging.info(f"Saved 4 semantic attention heatmaps for sample {sample_id} {step_title}")
+        # 5. Single Action Heatmaps (for each action step individually)
+        if a_end > 0 and total_context > 0:
+            self._create_single_action_heatmaps(attn, sample_id, timestamp)
+
+        logging.info(f"Saved semantic attention heatmaps for sample {sample_id}")
+
+    def _create_single_action_heatmaps(
+        self,
+        attn: "np.ndarray",
+        sample_id: int,
+        timestamp: str,
+    ) -> None:
+        """Create heatmaps showing how each individual action attends to context."""
+        import matplotlib.pyplot as plt
+        import numpy as np
+
+        a_end = self._num_actions
+        total_context = self._num_vlm_tokens + self._num_aux_tokens + self._num_soft_prompts
+
+        if a_end == 0 or total_context == 0:
+            return
+
+        # Create a grid showing each action's attention to context
+        cols = min(5, a_end)
+        rows = (a_end + cols - 1) // cols
+
+        fig, axes = plt.subplots(rows, cols, figsize=(cols * 3, rows * 2.5))
+        if a_end == 1:
+            axes = np.array([[axes]])
+        elif rows == 1:
+            axes = axes.reshape(1, -1)
+        elif cols == 1:
+            axes = axes.reshape(-1, 1)
+
+        for action_idx in range(a_end):
+            row, col = action_idx // cols, action_idx % cols
+            ax = axes[row, col]
+
+            # Get this action's attention to all context tokens
+            action_attention = attn[action_idx, a_end:]
+
+            # Show as bar plot for better readability
+            ax.bar(range(len(action_attention)), action_attention, color="steelblue", alpha=0.8, width=1.0)
+
+            # Add vertical lines for segment boundaries
+            ax.axvline(x=self._num_vlm_tokens - 0.5, color="red", linewidth=1.5, linestyle="--", alpha=0.7)
+            if self._num_aux_tokens > 0:
+                ax.axvline(
+                    x=self._num_vlm_tokens + self._num_aux_tokens - 0.5,
+                    color="orange",
+                    linewidth=1.5,
+                    linestyle="--",
+                    alpha=0.7,
+                )
+
+            ax.set_title(f"Action {action_idx}", fontsize=9)
+            ax.set_xlim(-0.5, total_context - 0.5)
+            ax.set_xticks([])
+            ax.set_yticks([])
+
+        # Hide unused subplots
+        for idx in range(a_end, rows * cols):
+            row, col = idx // cols, idx % cols
+            axes[row, col].axis("off")
+
+        fig.suptitle(f"Sample {sample_id} - Single Action→Context Attention", fontsize=12)
+        plt.tight_layout()
+        path = self.output_dir / f"attention_{sample_id}_5_single_actions_{timestamp}.png"
+        plt.savefig(path, dpi=120, bbox_inches="tight")
+        plt.close(fig)
+
+        # Also create a combined heatmap view
+        fig, ax = plt.subplots(figsize=(12, 4))
+        single_action_matrix = attn[:a_end, a_end:]
+        im = ax.imshow(single_action_matrix, cmap="viridis", aspect="auto")
+        plt.colorbar(im, ax=ax)
+
+        ax.axvline(x=self._num_vlm_tokens - 0.5, color="white", linewidth=2, linestyle="--", alpha=0.8)
+        if self._num_aux_tokens > 0:
+            ax.axvline(
+                x=self._num_vlm_tokens + self._num_aux_tokens - 0.5,
+                color="white",
+                linewidth=2,
+                linestyle="--",
+                alpha=0.8,
+            )
+
+        ax.set_title(f"Sample {sample_id} - Per-Action Context Attention", fontsize=11)
+        ax.set_xlabel("Context Token", fontsize=10)
+        ax.set_ylabel("Action Step", fontsize=10)
+        ax.set_yticks(range(a_end))
+        ax.set_yticklabels([f"A{i}" for i in range(a_end)])
+
+        plt.tight_layout()
+        path = self.output_dir / f"attention_{sample_id}_6_per_action_heatmap_{timestamp}.png"
+        plt.savefig(path, dpi=120, bbox_inches="tight")
+        plt.close(fig)
 
     def collect_from_model(self, model: "XVLAModel", sample_id: int | None = None) -> None:
         if not self._collecting_this_sample:
@@ -481,12 +557,8 @@ class XVLAAttentionCollector:
 
         timestamp = time.strftime("%Y%m%d_%H%M%S")
 
-        # Save denoising step evolution with semantic heatmaps
-        if self._denoising_step_weights:
-            self.save_denoising_steps(sample_id, timestamp)
-
-        # Create final semantic heatmaps
-        self._create_semantic_heatmaps(attention_weights, sample_id, step_idx=None, timestamp=timestamp)
+        # Create final semantic heatmaps (no denoising step evolution)
+        self._create_semantic_heatmaps(attention_weights, sample_id, timestamp=timestamp)
 
         self._collecting_this_sample = False
         logging.info(f"Completed attention visualization for sample {sample_id}")
@@ -494,7 +566,6 @@ class XVLAAttentionCollector:
     def reset(self) -> None:
         self._sample_counter = 0
         self._call_count = 0
-        self._denoising_step_weights: list[dict] = []
         self._collecting_this_sample = False
         self._num_actions = 0
         self._num_vlm_tokens = 0
@@ -514,153 +585,11 @@ class XVLAAttentionCollector:
 
         if should_collect:
             self._collecting_this_sample = True
-            self._denoising_step_weights.clear()  # Clear previous data
             logging.info(f"Starting attention collection for sample (call {self._call_count})")
         else:
             self._collecting_this_sample = False
 
         return should_collect
-
-    def collect_denoising_step(self, model: "XVLAModel", step_idx: int, total_steps: int) -> None:
-        """Collect attention weights for a single denoising step."""
-        if not self._collecting_this_sample:
-            return
-
-        attention_weights = {}
-        for layer_idx, block in enumerate(model.transformer.blocks):
-            weights = block.attn.get_last_attention_weights()
-            if weights is not None:
-                if weights.dtype != torch.float32:
-                    weights = weights.float()
-                attention_weights[f"policy_layer_{layer_idx}"] = weights.numpy()
-
-        if attention_weights:
-            self._denoising_step_weights.append(
-                {
-                    "step_idx": step_idx,
-                    "total_steps": total_steps,
-                    "weights": attention_weights,
-                }
-            )
-
-    def save_denoising_steps(self, sample_id: int, timestamp: str = "") -> None:
-        """Save semantic attention heatmaps for each denoising step."""
-        if not self._denoising_step_weights:
-            return
-
-        if not self._has_matplotlib:
-            self._denoising_step_weights.clear()
-            return
-
-        import matplotlib.pyplot as plt
-        import numpy as np
-
-        if not timestamp:
-            timestamp = time.strftime("%Y%m%d_%H%M%S")
-
-        total_steps = self._denoising_step_weights[0]["total_steps"]
-        num_steps = len(self._denoising_step_weights)
-
-        logging.info(f"Saving semantic heatmaps for {num_steps} denoising steps (sample {sample_id})")
-
-        layer_names = list(self._denoising_step_weights[0]["weights"].keys())
-        if not layer_names:
-            self._denoising_step_weights.clear()
-            return
-
-        # Calculate segment boundaries
-        a_end = self._num_actions
-        total_context = self._num_vlm_tokens + self._num_aux_tokens + self._num_soft_prompts
-
-        # 1. Create Action→Context evolution plot
-        # Shows how actions attend to context across denoising steps
-        last_layer = sorted(layer_names)[-1]
-
-        if a_end > 0 and total_context > 0:
-            cols = min(5, num_steps)
-            rows = (num_steps + cols - 1) // cols
-
-            fig, axes = plt.subplots(rows, cols, figsize=(cols * 4, rows * 3))
-            if num_steps == 1:
-                axes = np.array([[axes]])
-            elif rows == 1:
-                axes = axes.reshape(1, -1)
-            elif cols == 1:
-                axes = axes.reshape(-1, 1)
-
-            for idx, step_data in enumerate(self._denoising_step_weights):
-                row, col = idx // cols, idx % cols
-                ax = axes[row, col]
-                attn = self._aggregate_heads(step_data["weights"][last_layer])
-                action_to_context = attn[:a_end, a_end:]
-                ax.imshow(action_to_context, cmap="viridis", aspect="auto")
-
-                # Add segment lines
-                ax.axvline(
-                    x=self._num_vlm_tokens - 0.5, color="white", linewidth=1, linestyle="--", alpha=0.7
-                )
-
-                step_num = step_data["step_idx"]
-                ax.set_title(f"Step {step_num}/{total_steps}", fontsize=10)
-                ax.set_xticks([])
-                ax.set_yticks([])
-
-            for idx in range(num_steps, rows * cols):
-                row, col = idx // cols, idx % cols
-                axes[row, col].axis("off")
-
-            fig.suptitle(f"Sample {sample_id} - Action→Context Evolution (Denoising)", fontsize=12)
-            plt.tight_layout()
-            path = self.output_dir / f"attention_{sample_id}_evolution_action_to_context_{timestamp}.png"
-            plt.savefig(path, dpi=100, bbox_inches="tight")
-            plt.close(fig)
-
-        # 2. Create Action Self-Attention evolution plot
-        if a_end > 1:
-            cols = min(5, num_steps)
-            rows = (num_steps + cols - 1) // cols
-
-            fig, axes = plt.subplots(rows, cols, figsize=(cols * 3, rows * 3))
-            if num_steps == 1:
-                axes = np.array([[axes]])
-            elif rows == 1:
-                axes = axes.reshape(1, -1)
-            elif cols == 1:
-                axes = axes.reshape(-1, 1)
-
-            for idx, step_data in enumerate(self._denoising_step_weights):
-                row, col = idx // cols, idx % cols
-                ax = axes[row, col]
-                attn = self._aggregate_heads(step_data["weights"][last_layer])
-                action_self = attn[:a_end, :a_end]
-                ax.imshow(action_self, cmap="viridis", aspect="auto")
-                step_num = step_data["step_idx"]
-                ax.set_title(f"Step {step_num}/{total_steps}", fontsize=10)
-                ax.set_xticks([])
-                ax.set_yticks([])
-
-            for idx in range(num_steps, rows * cols):
-                row, col = idx // cols, idx % cols
-                axes[row, col].axis("off")
-
-            fig.suptitle(f"Sample {sample_id} - Action Self-Attention Evolution (Denoising)", fontsize=12)
-            plt.tight_layout()
-            path = self.output_dir / f"attention_{sample_id}_evolution_action_self_{timestamp}.png"
-            plt.savefig(path, dpi=100, bbox_inches="tight")
-            plt.close(fig)
-
-        # 3. Save detailed semantic heatmaps for first, middle, and last step only
-        key_steps = [0, num_steps // 2, num_steps - 1] if num_steps > 2 else list(range(num_steps))
-        key_steps = sorted(set(key_steps))  # Remove duplicates
-
-        for idx in key_steps:
-            step_data = self._denoising_step_weights[idx]
-            self._create_semantic_heatmaps(
-                step_data["weights"], sample_id, step_idx=step_data["step_idx"], timestamp=timestamp
-            )
-
-        self._denoising_step_weights.clear()
-        logging.info(f"Saved denoising evolution plots for sample {sample_id}")
 
 
 # Global attention collector instance
@@ -964,10 +893,6 @@ class XVLAModel(nn.Module):
                 t=t,
                 **enc,
             )
-
-            # Collect attention weights for this denoising step
-            if should_collect:
-                collector.collect_denoising_step(self, steps - i + 1, steps)
 
             step_time = profiler.end_timer(t_step, f"denoising_step_{steps - i + 1}")
             denoising_step_times.append(step_time)
