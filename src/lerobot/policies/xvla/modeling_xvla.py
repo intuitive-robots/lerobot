@@ -184,6 +184,7 @@ class XVLAAttentionCollector:
         self.save_interval = save_interval
         self._call_count = 0
         self._has_matplotlib = self._check_matplotlib()
+        self._denoising_step_weights: list[dict] = []  # Store weights for each denoising step
 
     def _check_matplotlib(self) -> bool:
         try:
@@ -356,21 +357,14 @@ class XVLAAttentionCollector:
 
         timestamp = time.strftime("%Y%m%d_%H%M%S")
 
-        # Create layer comparison heatmap (all layers in one image)
-        comparison_path = self.output_dir / f"attention_sample_{sample_id}_{timestamp}.png"
-        self._create_layer_comparison(attention_weights, sample_id, comparison_path)
-        logging.info(f"Saved attention heatmap to {comparison_path}")
+        # Save denoising step evolution if we collected any
+        if self._denoising_step_weights:
+            self.save_denoising_steps(sample_id)
 
-        # Optionally create individual layer heatmaps for first, middle, last layers
-        key_layers = self._get_key_layers(list(attention_weights.keys()))
-        for layer_name in key_layers:
-            attn = self._aggregate_heads(attention_weights[layer_name])
-            layer_path = self.output_dir / f"attention_sample_{sample_id}_{layer_name}_{timestamp}.png"
-            self._create_heatmap(
-                attn,
-                f"Sample {sample_id} - {layer_name}",
-                layer_path,
-            )
+        # Create layer comparison heatmap (all layers in one image) - final step
+        comparison_path = self.output_dir / f"attention_sample_{sample_id}_final_{timestamp}.png"
+        self._create_layer_comparison(attention_weights, sample_id, comparison_path)
+        logging.info(f"Saved final attention heatmap to {comparison_path}")
 
     def _get_key_layers(self, layer_names: list) -> list:
         """Get first, middle, and last layer names."""
@@ -387,6 +381,95 @@ class XVLAAttentionCollector:
     def reset(self) -> None:
         self._sample_counter = 0
         self._call_count = 0
+        self._denoising_step_weights: list[dict] = []  # Store weights for each denoising step
+
+    def collect_denoising_step(self, model: "XVLAModel", step_idx: int, total_steps: int) -> None:
+        """Collect attention weights for a single denoising step."""
+        if not self._enabled:
+            return
+
+        attention_weights = {}
+        for layer_idx, block in enumerate(model.transformer.blocks):
+            weights = block.attn.get_last_attention_weights()
+            if weights is not None:
+                if weights.dtype != torch.float32:
+                    weights = weights.float()
+                attention_weights[f"policy_layer_{layer_idx}"] = weights.numpy()
+
+        if attention_weights:
+            self._denoising_step_weights.append({
+                "step_idx": step_idx,
+                "total_steps": total_steps,
+                "weights": attention_weights,
+            })
+
+    def save_denoising_steps(self, sample_id: int) -> None:
+        """Save all collected denoising step attention maps."""
+        if not self._denoising_step_weights:
+            return
+
+        if not self._has_matplotlib:
+            self._denoising_step_weights.clear()
+            return
+
+        import matplotlib.pyplot as plt
+
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        total_steps = self._denoising_step_weights[0]["total_steps"]
+
+        logging.info(f"Saving {len(self._denoising_step_weights)} denoising step heatmaps for sample {sample_id}")
+
+        # Create a comparison image showing how attention evolves across denoising steps
+        # Pick one layer (middle layer) to show evolution
+        layer_names = list(self._denoising_step_weights[0]["weights"].keys())
+        if not layer_names:
+            self._denoising_step_weights.clear()
+            return
+
+        mid_layer = sorted(layer_names)[len(layer_names) // 2]
+
+        # Create evolution plot for middle layer
+        num_steps = len(self._denoising_step_weights)
+        cols = min(5, num_steps)
+        rows = (num_steps + cols - 1) // cols
+
+        fig, axes = plt.subplots(rows, cols, figsize=(cols * 3, rows * 3))
+        if num_steps == 1:
+            axes = [[axes]]
+        elif rows == 1:
+            axes = [axes]
+        elif cols == 1:
+            axes = [[ax] for ax in axes]
+
+        for idx, step_data in enumerate(self._denoising_step_weights):
+            row, col = idx // cols, idx % cols
+            ax = axes[row][col]
+            attn = self._aggregate_heads(step_data["weights"][mid_layer])
+            ax.imshow(attn, cmap="viridis", aspect="auto")
+            step_num = step_data["step_idx"]
+            ax.set_title(f"Step {step_num}/{total_steps}", fontsize=9)
+            ax.set_xticks([])
+            ax.set_yticks([])
+
+        # Hide unused subplots
+        for idx in range(num_steps, rows * cols):
+            row, col = idx // cols, idx % cols
+            axes[row][col].axis("off")
+
+        fig.suptitle(f"Sample {sample_id} - {mid_layer} - Attention Evolution", fontsize=12)
+        plt.tight_layout()
+        evolution_path = self.output_dir / f"attention_sample_{sample_id}_evolution_{timestamp}.png"
+        plt.savefig(evolution_path, dpi=100, bbox_inches="tight")
+        plt.close(fig)
+        logging.info(f"Saved attention evolution to {evolution_path}")
+
+        # Also save individual step heatmaps
+        for step_data in self._denoising_step_weights:
+            step_idx = step_data["step_idx"]
+            step_path = self.output_dir / f"attention_sample_{sample_id}_step_{step_idx}_{timestamp}.png"
+            self._create_layer_comparison(step_data["weights"], f"{sample_id} Step {step_idx}", step_path)
+
+        self._denoising_step_weights.clear()
 
 
 # Global attention collector instance
@@ -678,6 +761,11 @@ class XVLAModel(nn.Module):
                 t=t,
                 **enc,
             )
+
+            # Collect attention weights for this denoising step
+            collector = get_attention_collector()
+            if collector.is_enabled():
+                collector.collect_denoising_step(self, steps - i + 1, steps)
 
             step_time = profiler.end_timer(t_step, f"denoising_step_{steps - i + 1}")
             denoising_step_times.append(step_time)
