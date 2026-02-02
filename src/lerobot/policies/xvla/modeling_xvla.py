@@ -24,7 +24,7 @@ import os
 import time
 from collections import defaultdict, deque
 from pathlib import Path
-from threading import Lock
+import threading
 
 import torch
 import torch.nn.functional as F  # noqa: N812
@@ -71,7 +71,7 @@ class XVLATimingProfiler:
         self.save_interval = save_interval
         self.timings: dict[str, list[float]] = defaultdict(list)
         self.call_count = 0
-        self._lock = Lock()
+        self._lock = threading.RLock()
         self._cuda_available = torch.cuda.is_available()
 
     def _sync_cuda(self) -> None:
@@ -197,7 +197,7 @@ class XVLAAttentionCollector:
             attn_module = block.attn
             weights = attn_module.get_last_attention_weights()
             if weights is not None:
-                attention_weights[f"policy_layer_{layer_idx}"] = weights.numpy()
+                attention_weights[f"policy_layer_{layer_idx}"] = weights.detach().cpu().to(torch.float32).numpy()
 
         if attention_weights:
             self.attention_data.append({
@@ -482,7 +482,7 @@ class XVLAModel(nn.Module):
 
         profiler = get_xvla_profiler()
         t_generate_total = profiler.start_timer()
-
+        print("Starting action generation...")
         target_dtype = self._get_target_dtype()
         image_input = image_input.to(dtype=target_dtype)
         proprio = proprio.to(dtype=target_dtype)
@@ -520,7 +520,7 @@ class XVLAModel(nn.Module):
             denoising_step_times.append(step_time)
 
         profiler.end_timer(t_denoising_total, "denoising_loop_total")
-
+        print("Completed action generation.")
         # Record average denoising step time
         if denoising_step_times:
             avg_step_time = sum(denoising_step_times) / len(denoising_step_times)
@@ -715,8 +715,9 @@ class XVLAPolicy(PreTrainedPolicy):
     def _get_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
         profiler = get_xvla_profiler()
         t_action_chunk = profiler.start_timer()
-
+        
         inputs = self._build_model_inputs(batch)
+        print("Generating action chunk...")
         actions = self.model.generate_actions(**inputs, steps=self.config.num_denoising_steps)
 
         # Automatically collect attention weights if enabled
@@ -748,13 +749,16 @@ class XVLAPolicy(PreTrainedPolicy):
         self._queues = populate_queues(self._queues, batch, exclude_keys=[ACTION])
 
         if len(self._queues[ACTION]) == 0:
+            print("Generating new action chunk...")
             t_generate = profiler.start_timer()
             actions = self._get_action_chunk(batch)
             profiler.end_timer(t_generate, "action_generation_in_select")
             self._queues[ACTION].extend(actions.transpose(0, 1)[: self.config.n_action_steps])
+            print(f"Generated {len(actions)} action steps.")
 
         result = self._queues[ACTION].popleft()
         profiler.end_timer(t_select, "select_action_total")
+        print("Selected action step.")
         return result
 
     @classmethod
