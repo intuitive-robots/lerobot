@@ -875,7 +875,6 @@ class XVLAPolicy(PreTrainedPolicy):
         t_action_chunk = profiler.start_timer()
         
         inputs = self._build_model_inputs(batch)
-        print("Generating action chunk...")
         actions = self.model.generate_actions(**inputs, steps=self.config.num_denoising_steps)
 
         # Automatically collect attention weights if enabled
@@ -907,16 +906,14 @@ class XVLAPolicy(PreTrainedPolicy):
         self._queues = populate_queues(self._queues, batch, exclude_keys=[ACTION])
 
         if len(self._queues[ACTION]) == 0:
-            print("Generating new action chunk...")
             t_generate = profiler.start_timer()
             actions = self._get_action_chunk(batch)
             profiler.end_timer(t_generate, "action_generation_in_select")
             self._queues[ACTION].extend(actions.transpose(0, 1)[: self.config.n_action_steps])
-            print(f"Generated {len(actions)} action steps.")
+
 
         result = self._queues[ACTION].popleft()
         profiler.end_timer(t_select, "select_action_total")
-        print("Selected action step.")
         return result
 
     @classmethod
