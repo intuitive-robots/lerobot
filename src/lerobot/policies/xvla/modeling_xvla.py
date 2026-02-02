@@ -397,11 +397,13 @@ class XVLAAttentionCollector:
                 attention_weights[f"policy_layer_{layer_idx}"] = weights.numpy()
 
         if attention_weights:
-            self._denoising_step_weights.append({
-                "step_idx": step_idx,
-                "total_steps": total_steps,
-                "weights": attention_weights,
-            })
+            self._denoising_step_weights.append(
+                {
+                    "step_idx": step_idx,
+                    "total_steps": total_steps,
+                    "weights": attention_weights,
+                }
+            )
 
     def save_denoising_steps(self, sample_id: int) -> None:
         """Save all collected denoising step attention maps."""
@@ -417,7 +419,9 @@ class XVLAAttentionCollector:
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         total_steps = self._denoising_step_weights[0]["total_steps"]
 
-        logging.info(f"Saving {len(self._denoising_step_weights)} denoising step heatmaps for sample {sample_id}")
+        logging.info(
+            f"Saving {len(self._denoising_step_weights)} denoising step heatmaps for sample {sample_id}"
+        )
 
         # Create a comparison image showing how attention evolves across denoising steps
         # Pick one layer (middle layer) to show evolution
