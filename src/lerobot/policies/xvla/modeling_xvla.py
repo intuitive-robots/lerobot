@@ -185,6 +185,7 @@ class XVLAAttentionCollector:
         self._call_count = 0
         self._has_matplotlib = self._check_matplotlib()
         self._denoising_step_weights: list[dict] = []  # Store weights for each denoising step
+        self._collecting_this_sample = False  # Flag to track if we should collect for current sample
 
     def _check_matplotlib(self) -> bool:
         try:
@@ -295,41 +296,21 @@ class XVLAAttentionCollector:
         plt.close(fig)
 
     def collect_from_model(self, model: "XVLAModel", sample_id: int | None = None) -> None:
-        if not self._enabled:
-            logging.debug("Attention collection is disabled, skipping.")
-            return
-
-        if not self._has_matplotlib:
-            logging.warning("matplotlib not available, cannot create heatmaps.")
-            return
-
-        self._call_count += 1
-
-        # Save on first call (call_count=1) and then every save_interval calls
-        should_save = (self._call_count == 1) or (
-            self.save_interval > 0 and self._call_count % self.save_interval == 0
-        )
-        if not should_save:
+        if not self._collecting_this_sample:
             return
 
         if sample_id is None:
             sample_id = self._sample_counter
             self._sample_counter += 1
 
-        logging.info(f"Collecting attention weights (call {self._call_count}, sample {sample_id})...")
+        logging.info(f"Saving attention heatmaps for sample {sample_id} (call {self._call_count})...")
 
         attention_weights = {}
         layers_with_weights = 0
-        layers_without_weights = 0
 
         # Collect from policy transformer blocks
         for layer_idx, block in enumerate(model.transformer.blocks):
             attn_module = block.attn
-
-            # Check if attention return is enabled
-            if not getattr(attn_module, "_return_attention", False):
-                logging.debug(f"Layer {layer_idx}: _return_attention is False")
-
             weights = attn_module.get_last_attention_weights()
             if weights is not None:
                 layers_with_weights += 1
@@ -337,17 +318,13 @@ class XVLAAttentionCollector:
                 if weights.dtype != torch.float32:
                     weights = weights.float()
                 attention_weights[f"policy_layer_{layer_idx}"] = weights.numpy()
-            else:
-                layers_without_weights += 1
-                logging.debug(f"Layer {layer_idx}: weights is None")
 
         if not attention_weights:
             logging.warning(
                 f"No attention weights found for sample {sample_id}. "
-                f"Checked {layers_with_weights + layers_without_weights} layers, "
-                f"{layers_without_weights} had None weights. "
                 f"Make sure _return_attention is True in Attention modules."
             )
+            self._collecting_this_sample = False
             return
 
         logging.info(
@@ -381,11 +358,32 @@ class XVLAAttentionCollector:
     def reset(self) -> None:
         self._sample_counter = 0
         self._call_count = 0
-        self._denoising_step_weights: list[dict] = []  # Store weights for each denoising step
+        self._denoising_step_weights: list[dict] = []
+        self._collecting_this_sample = False
+
+    def should_collect_sample(self) -> bool:
+        """Check if we should collect attention for the current sample and start collection."""
+        if not self._enabled or not self._has_matplotlib:
+            return False
+
+        self._call_count += 1
+        # Collect on first call and then every save_interval calls
+        should_collect = (self._call_count == 1) or (
+            self.save_interval > 0 and self._call_count % self.save_interval == 0
+        )
+
+        if should_collect:
+            self._collecting_this_sample = True
+            self._denoising_step_weights.clear()  # Clear previous data
+            logging.info(f"Starting attention collection for sample (call {self._call_count})")
+        else:
+            self._collecting_this_sample = False
+
+        return should_collect
 
     def collect_denoising_step(self, model: "XVLAModel", step_idx: int, total_steps: int) -> None:
         """Collect attention weights for a single denoising step."""
-        if not self._enabled:
+        if not self._collecting_this_sample:
             return
 
         attention_weights = {}
@@ -748,6 +746,12 @@ class XVLAModel(nn.Module):
 
         steps = max(1, int(steps))
 
+        # Check if we should collect attention for this sample
+        collector = get_attention_collector()
+        should_collect = collector.should_collect_sample()
+        if should_collect:
+            logging.debug(f"[AttentionCollector] Starting collection for sample {collector._sample_counter}")
+
         # Time denoising loop
         t_denoising_total = profiler.start_timer()
         denoising_step_times = []
@@ -767,14 +771,18 @@ class XVLAModel(nn.Module):
             )
 
             # Collect attention weights for this denoising step
-            collector = get_attention_collector()
-            if collector.is_enabled():
+            if should_collect:
                 collector.collect_denoising_step(self, steps - i + 1, steps)
 
             step_time = profiler.end_timer(t_step, f"denoising_step_{steps - i + 1}")
             denoising_step_times.append(step_time)
 
         profiler.end_timer(t_denoising_total, "denoising_loop_total")
+
+        # Save attention heatmaps after denoising loop is complete
+        if should_collect:
+            logging.debug(f"[AttentionCollector] Calling collect_from_model after denoising loop")
+            collector.collect_from_model(self)
 
         # Record average denoising step time
         if denoising_step_times:
