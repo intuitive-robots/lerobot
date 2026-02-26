@@ -81,7 +81,7 @@ class XVLAConfig(PreTrainedConfig):
 
     # Action & proprioception
     action_mode: str = "ee6d"
-    num_denoising_steps: int = 10
+    num_denoising_steps: int = 6
     use_proprio: bool = True
     max_state_dim: int = 32
     max_action_dim: int = 20  # Maximum action dimension for padding (used by "auto" action mode)
@@ -112,6 +112,9 @@ class XVLAConfig(PreTrainedConfig):
     scheduler_warmup_steps: int = 1_000
     scheduler_decay_steps: int = 30_000
     scheduler_decay_lr: float = 2.5e-6
+    
+    load_weights: Any = None  
+    observation_delta_indices: list[int] | None = None
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -190,9 +193,9 @@ class XVLAConfig(PreTrainedConfig):
             num_decay_steps=self.scheduler_decay_steps,
         )
 
-    @property
-    def observation_delta_indices(self) -> list[int] | None:
-        return None
+    # @property
+    # def observation_delta_indices(self) -> list[int] | None:
+    #     return None
 
     @property
     def action_delta_indices(self) -> list[int]:

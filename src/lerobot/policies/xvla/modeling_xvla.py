@@ -1120,8 +1120,8 @@ class XVLAPolicy(PreTrainedPolicy):
         t_action_chunk = profiler.start_timer()
         
         inputs = self._build_model_inputs(batch)
-        actions = self.model.generate_actions(**inputs, steps=self.config.num_denoising_steps)
-
+        # actions = self.model.generate_actions(**inputs, steps=self.config.num_denoising_steps)
+        actions = self.model.generate_actions(**inputs, steps=6)
         # Automatically collect attention weights if enabled
         collector = get_attention_collector()
         if collector.is_enabled():
