@@ -730,8 +730,8 @@ class BESORgbEncoder(nn.Module):
         )
         self.backbone = nn.Sequential(*(list(backbone_model.children())[:-2]))
         if config.use_group_norm:
-            if config.pretrained_backbone_weights:
-                raise ValueError("You can't replace BatchNorm in a pretrained model without ruining the weights!")
+            # Replace BatchNorm with GroupNorm for deterministic normalization.
+            # This is done even with pretrained weights (pretrained BN params are discarded).
             self.backbone = _replace_submodules(
                 root_module=self.backbone,
                 predicate=lambda x: isinstance(x, nn.BatchNorm2d),

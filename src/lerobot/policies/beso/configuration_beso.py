@@ -36,31 +36,31 @@ class BESOConfig(PreTrainedConfig):
     resize_shape: tuple[int, int] | None = None
     crop_ratio: float = 1.0
     crop_shape: tuple[int, int] | None = None
-    crop_is_random: bool = True
-    pretrained_backbone_weights: str | None = None
+    crop_is_random: bool = False
+    pretrained_backbone_weights: str | None = "ResNet18_Weights.IMAGENET1K_V1"
     use_group_norm: bool = True
     spatial_softmax_num_keypoints: int = 32
-    use_separate_rgb_encoder_per_camera: bool = False
+    use_separate_rgb_encoder_per_camera: bool = True
 
     # MDT Transformer
-    embed_dim: int = 256
-    n_enc_layers: int = 4
-    n_dec_layers: int = 4
-    n_heads: int = 4
+    embed_dim: int = 512
+    n_enc_layers: int = 6
+    n_dec_layers: int = 6
+    n_heads: int = 8
     embed_pdrop: float = 0.0
-    attn_pdrop: float = 0.0
-    resid_pdrop: float = 0.0
-    mlp_pdrop: float = 0.0
+    attn_pdrop: float = 0.3
+    resid_pdrop: float = 0.1
+    mlp_pdrop: float = 0.1
     goal_dim: int = 512
     goal_seq_len: int = 1
     goal_drop: float = 0.1
-    use_ada_conditioning: bool = True
+    use_ada_conditioning: bool = False
     use_noise_encoder: bool = False
     linear_output: bool = True
 
     # EDM Diffusion
     sampler_type: str = "ddim"
-    num_sampling_steps: int = 10
+    num_sampling_steps: int = 4
     sigma_data: float = 0.5
     sigma_min: float = 0.001
     sigma_max: float = 80.0
@@ -72,9 +72,9 @@ class BESOConfig(PreTrainedConfig):
 
     # Training presets
     optimizer_lr: float = 1e-4
-    optimizer_betas: tuple = (0.95, 0.999)
+    optimizer_betas: tuple = (0.9, 0.9)
     optimizer_eps: float = 1e-8
-    optimizer_weight_decay: float = 1e-6
+    optimizer_weight_decay: float = 0.05
     scheduler_name: str = "cosine"
     scheduler_warmup_steps: int = 500
 
