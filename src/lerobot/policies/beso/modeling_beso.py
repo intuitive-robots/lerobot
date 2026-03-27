@@ -837,6 +837,13 @@ class BESOModel(nn.Module):
         # Action dimension
         action_dim = config.action_feature.shape[0]
 
+        # Compute the actual observation sequence length that _encode_observations produces.
+        # Visual/env features produce n_obs_steps tokens, and if robot_state_feature is present
+        # it gets concatenated as additional tokens (also n_obs_steps), so total can be 2*n_obs_steps.
+        obs_seq_len = config.n_obs_steps
+        if config.robot_state_feature:
+            obs_seq_len += config.n_obs_steps
+
         # Inner model: MDTTransformer
         inner_model = MDTTransformer(
             obs_dim=config.embed_dim,
@@ -851,7 +858,7 @@ class BESOModel(nn.Module):
             n_enc_layers=config.n_enc_layers,
             n_heads=config.n_heads,
             goal_seq_len=config.goal_seq_len,
-            obs_seq_len=config.n_obs_steps,
+            obs_seq_len=obs_seq_len,
             action_seq_len=config.horizon,
             goal_drop=config.goal_drop,
             bias=False,
