@@ -1,3 +1,11 @@
+"""BESO Policy: BEhavior generation with Score-based diffusiOn.
+
+Implements the BESO policy using EDM-style (Karras et al. 2022) score matching diffusion
+with an encoder-only Transformer backbone (matching fast_mail's Noise_Dec_only architecture).
+
+Ported from the fast_mail implementation to follow lerobot's policy patterns.
+"""
+
 import math
 from collections import deque
 from functools import partial
@@ -50,26 +58,22 @@ def rand_log_logistic(
 
 
 def rand_log_normal(shape, loc=0.0, scale=1.0, device="cpu", dtype=torch.float32) -> Tensor:
-    """Draws samples from a lognormal distribution."""
     return (torch.randn(shape, device=device, dtype=dtype) * scale + loc).exp()
 
 
 def rand_log_uniform(shape, min_value, max_value, device="cpu", dtype=torch.float32) -> Tensor:
-    """Draws samples from a log-uniform distribution."""
     min_value = math.log(min_value)
     max_value = math.log(max_value)
     return (torch.rand(shape, device=device, dtype=dtype) * (max_value - min_value) + min_value).exp()
 
 
 def rand_uniform(shape, min_value, max_value, device="cpu", dtype=torch.float32) -> Tensor:
-    """Draws samples from a uniform distribution."""
     return torch.rand(shape, device=device, dtype=dtype) * (max_value - min_value) + min_value
 
 
 def rand_v_diffusion(
     shape, sigma_data=1.0, min_value=0.0, max_value=float("inf"), device="cpu", dtype=torch.float32
 ) -> Tensor:
-    """Draws samples from a truncated v-diffusion training timestep distribution."""
     min_cdf = math.atan(min_value / sigma_data) * 2 / math.pi
     max_cdf = math.atan(max_value / sigma_data) * 2 / math.pi
     u = torch.rand(shape, device=device, dtype=dtype) * (max_cdf - min_cdf) + min_cdf
@@ -80,7 +84,6 @@ def rand_v_diffusion(
 
 
 def get_sigmas_karras(n, sigma_min, sigma_max, rho=7.0, device="cpu") -> Tensor:
-    """Constructs the noise schedule of Karras et al. (2022)."""
     ramp = torch.linspace(0, 1, n)
     min_inv_rho = sigma_min ** (1 / rho)
     max_inv_rho = sigma_max ** (1 / rho)
@@ -89,26 +92,22 @@ def get_sigmas_karras(n, sigma_min, sigma_max, rho=7.0, device="cpu") -> Tensor:
 
 
 def get_sigmas_exponential(n, sigma_min, sigma_max, device="cpu") -> Tensor:
-    """Constructs an exponential noise schedule."""
     sigmas = torch.linspace(math.log(sigma_max), math.log(sigma_min), n, device=device).exp()
     return append_zero(sigmas)
 
 
 def get_sigmas_linear(n, sigma_min, sigma_max, device="cpu") -> Tensor:
-    """Constructs a linear noise schedule."""
     sigmas = torch.linspace(sigma_max, sigma_min, n, device=device)
     return append_zero(sigmas)
 
 
 def get_sigmas_vp(n, beta_d=19.9, beta_min=0.1, eps_s=1e-3, device="cpu") -> Tensor:
-    """Constructs a continuous VP noise schedule."""
     t = torch.linspace(1, eps_s, n, device=device)
     sigmas = torch.sqrt(torch.exp(beta_d * t**2 / 2 + beta_min * t) - 1)
     return append_zero(sigmas)
 
 
 def cosine_beta_schedule(n, s=0.008, device="cpu") -> Tensor:
-    """Cosine schedule as proposed in https://openreview.net/forum?id=-NEXDKk8gZ"""
     steps = n + 1
     x = np.linspace(0, steps, steps)
     alphas_cumprod = np.cos(((x / steps) + s) / (1 + s) * np.pi * 0.5) ** 2
@@ -119,7 +118,6 @@ def cosine_beta_schedule(n, s=0.008, device="cpu") -> Tensor:
 
 
 def get_sigmas_ve(n, sigma_min=0.02, sigma_max=100, device="cpu") -> Tensor:
-    """Constructs a VE noise schedule."""
     t = torch.linspace(0, n, n, device=device)
     t = (sigma_max**2) * ((sigma_min**2 / sigma_max**2) ** (t / (n - 1)))
     sigmas = torch.sqrt(t)
@@ -127,10 +125,9 @@ def get_sigmas_ve(n, sigma_min=0.02, sigma_max=100, device="cpu") -> Tensor:
 
 
 def get_iddpm_sigmas(n, sigma_min=0.02, sigma_max=100, M=1000, j_0=0, C_1=0.001, C_2=0.008, device="cpu"):
-    """Constructs IDDPM sigmas."""
     step_indices = torch.arange(n, dtype=torch.float64, device=device)
     u = torch.zeros(M + 1, dtype=torch.float64, device=device)
-    alpha_bar = lambda j: (0.5 * np.pi * j / M / (C_2 + 1)).sin() ** 2
+    alpha_bar = lambda j: (0.5 * np.pi * j / M / (C_2 + 1)).sin() ** 2  # noqa: E731
     for j in torch.arange(M, j_0, -1, device=device):
         u[j - 1] = ((u[j] ** 2 + 1) / (alpha_bar(j - 1) / alpha_bar(j)).clip(min=C_1) - 1).sqrt()
     u_filtered = u[torch.logical_and(u >= sigma_min, u <= sigma_max)]
@@ -142,12 +139,10 @@ def get_iddpm_sigmas(n, sigma_min=0.02, sigma_max=100, M=1000, j_0=0, C_1=0.001,
 
 
 def to_d(action: Tensor, sigma: Tensor, denoised: Tensor) -> Tensor:
-    """Converts a denoiser output to a Karras ODE derivative."""
     return (action - denoised) / append_dims(sigma, action.ndim)
 
 
 def get_ancestral_step(sigma_from, sigma_to, eta=1.0):
-    """Calculates sigma_down and sigma_up for ancestral sampling."""
     if not eta:
         return sigma_to, 0.0
     sigma_up = min(sigma_to, eta * (sigma_to**2 * (sigma_from**2 - sigma_to**2) / sigma_from**2) ** 0.5)
@@ -157,11 +152,9 @@ def get_ancestral_step(sigma_from, sigma_to, eta=1.0):
 
 @torch.no_grad()
 def sample_ddim(model, state, action, goal, sigmas, scaler=None, disable=True, **extra_args):
-    """DDIM sampler (1st order DPM-Solver)."""
     s_in = action.new_ones([action.shape[0]])
-    sigma_fn = lambda t: t.neg().exp()
-    t_fn = lambda sigma: sigma.log().neg()
-
+    sigma_fn = lambda t: t.neg().exp()  # noqa: E731
+    t_fn = lambda sigma: sigma.log().neg()  # noqa: E731
     for i in trange(len(sigmas) - 1, disable=disable):
         denoised = model(state, action, goal, sigmas[i] * s_in)
         t, t_next = t_fn(sigmas[i]), t_fn(sigmas[i + 1])
@@ -171,8 +164,8 @@ def sample_ddim(model, state, action, goal, sigmas, scaler=None, disable=True, *
 
 
 @torch.no_grad()
-def sample_euler(model, state, action, goal, sigmas, scaler=None, disable=True, s_churn=0.0, s_tmin=0.0, s_tmax=float("inf"), s_noise=1.0, **extra_args):
-    """Euler sampler (Algorithm 2 from Karras et al. 2022)."""
+def sample_euler(model, state, action, goal, sigmas, scaler=None, disable=True,
+                 s_churn=0.0, s_tmin=0.0, s_tmax=float("inf"), s_noise=1.0, **extra_args):
     s_in = action.new_ones([action.shape[0]])
     for i in trange(len(sigmas) - 1, disable=disable):
         gamma = min(s_churn / (len(sigmas) - 1), 2**0.5 - 1) if s_tmin <= sigmas[i] <= s_tmax else 0.0
@@ -190,8 +183,8 @@ def sample_euler(model, state, action, goal, sigmas, scaler=None, disable=True, 
 
 
 @torch.no_grad()
-def sample_heun(model, state, action, goal, sigmas, scaler=None, disable=True, s_churn=0.0, s_tmin=0.0, s_tmax=float("inf"), s_noise=1.0, **extra_args):
-    """Heun sampler (2nd order, Algorithm 2 from Karras et al. 2022)."""
+def sample_heun(model, state, action, goal, sigmas, scaler=None, disable=True,
+                s_churn=0.0, s_tmin=0.0, s_tmax=float("inf"), s_noise=1.0, **extra_args):
     s_in = action.new_ones([action.shape[0]])
     for i in trange(len(sigmas) - 1, disable=disable):
         gamma = min(s_churn / (len(sigmas) - 1), 2**0.5 - 1) if s_tmin <= sigmas[i] <= s_tmax else 0.0
@@ -217,7 +210,6 @@ def sample_heun(model, state, action, goal, sigmas, scaler=None, disable=True, s
 
 @torch.no_grad()
 def sample_euler_ancestral(model, state, action, goal, sigmas, scaler=None, disable=True, eta=1.0, **extra_args):
-    """Ancestral sampling with Euler method steps."""
     s_in = action.new_ones([action.shape[0]])
     for i in trange(len(sigmas) - 1, disable=disable):
         denoised = model(state, action, goal, sigmas[i] * s_in)
@@ -234,12 +226,10 @@ def sample_euler_ancestral(model, state, action, goal, sigmas, scaler=None, disa
 
 @torch.no_grad()
 def sample_dpmpp_2m(model, state, action, goal, sigmas, scaler=None, disable=True, **extra_args):
-    """DPM-Solver++(2M)."""
     s_in = action.new_ones([action.shape[0]])
-    sigma_fn = lambda t: t.neg().exp()
-    t_fn = lambda sigma: sigma.log().neg()
+    sigma_fn = lambda t: t.neg().exp()  # noqa: E731
+    t_fn = lambda sigma: sigma.log().neg()  # noqa: E731
     old_denoised = None
-
     for i in trange(len(sigmas) - 1, disable=disable):
         denoised = model(state, action, goal, sigmas[i] * s_in)
         t, t_next = t_fn(sigmas[i]), t_fn(sigmas[i + 1])
@@ -257,9 +247,8 @@ def sample_dpmpp_2m(model, state, action, goal, sigmas, scaler=None, disable=Tru
 
 @torch.no_grad()
 def sample_dpmpp_2s(model, state, action, goal, sigmas, scaler=None, disable=True, **extra_args):
-    """DPM-Solver++(2S) second-order steps."""
-    sigma_fn = lambda t: t.neg().exp()
-    t_fn = lambda sigma: sigma.log().neg()
+    sigma_fn = lambda t: t.neg().exp()  # noqa: E731
+    t_fn = lambda sigma: sigma.log().neg()  # noqa: E731
     s_in = action.new_ones([action.shape[0]])
     for i in trange(len(sigmas) - 1, disable=disable):
         denoised = model(state, action, goal, sigmas[i] * s_in)
@@ -280,7 +269,6 @@ def sample_dpmpp_2s(model, state, action, goal, sigmas, scaler=None, disable=Tru
     return action
 
 
-# Map sampler names to functions
 SAMPLERS = {
     "ddim": sample_ddim,
     "euler": sample_euler,
@@ -290,7 +278,6 @@ SAMPLERS = {
     "dpmpp_2s": sample_dpmpp_2s,
 }
 
-# Map noise schedule names to functions
 NOISE_SCHEDULES = {
     "karras": get_sigmas_karras,
     "exponential": get_sigmas_exponential,
@@ -302,25 +289,41 @@ NOISE_SCHEDULES = {
 }
 
 
-# ==================== Transformer Components ====================
+# ==================== Transformer Components (matching fast_mail) ====================
 
 
-class BESOLayerNorm(nn.Module):
-    """LayerNorm with optional bias."""
+class BESORMSNorm(nn.Module):
+    """RMSNorm — better, simpler alternative to LayerNorm (matching fast_mail blocks)."""
 
-    def __init__(self, ndim: int, bias: bool = False):
+    def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(ndim))
-        self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None
+        self.scale = dim ** -0.5
+        self.eps = eps
+        self.g = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: Tensor) -> Tensor:
-        return F.layer_norm(x, self.weight.shape, self.weight, self.bias, 1e-5)
+        norm = torch.norm(x, dim=-1, keepdim=True) * self.scale
+        return x / norm.clamp(min=self.eps) * self.g
+
+
+class BESOSwishGLU(nn.Module):
+    """Gated Linear Unit with Swish activation (matching fast_mail blocks)."""
+
+    def __init__(self, in_dim: int, out_dim: int):
+        super().__init__()
+        self.act = nn.SiLU()
+        self.project = nn.Linear(in_dim, 2 * out_dim)
+
+    def forward(self, x: Tensor) -> Tensor:
+        projected, gate = self.project(x).tensor_split(2, dim=-1)
+        return projected * self.act(gate)
 
 
 class BESOAttention(nn.Module):
-    """Multi-head attention with optional cross-attention."""
+    """Multi-head attention with QK-norm and optional causal masking."""
 
-    def __init__(self, n_embd: int, n_head: int, attn_pdrop: float, resid_pdrop: float, block_size: int, causal: bool = False, bias: bool = False):
+    def __init__(self, n_embd: int, n_head: int, attn_pdrop: float, resid_pdrop: float,
+                 block_size: int = 100, causal: bool = False, bias: bool = False, qk_norm: bool = True):
         super().__init__()
         assert n_embd % n_head == 0
         self.key = nn.Linear(n_embd, n_embd)
@@ -332,6 +335,12 @@ class BESOAttention(nn.Module):
         self.n_head = n_head
         self.n_embd = n_embd
         self.causal = causal
+        self.qk_norm = qk_norm
+        if self.qk_norm:
+            self.q_norm = BESORMSNorm(n_embd // self.n_head, eps=1e-6)
+            self.k_norm = BESORMSNorm(n_embd // self.n_head, eps=1e-6)
+        else:
+            self.q_norm = self.k_norm = nn.Identity()
 
     def forward(self, x: Tensor, context: Tensor | None = None) -> Tensor:
         B, T, C = x.size()
@@ -343,7 +352,8 @@ class BESOAttention(nn.Module):
             k = self.key(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
             q = self.query(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
             v = self.value(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-
+        q = self.q_norm(q)
+        k = self.k_norm(k)
         y = F.scaled_dot_product_attention(
             q, k, v, dropout_p=self.attn_dropout.p if self.training else 0, is_causal=self.causal
         )
@@ -353,35 +363,34 @@ class BESOAttention(nn.Module):
 
 
 class BESOMLP(nn.Module):
-    """Feed-forward MLP block."""
+    """SwishGLU MLP (matching fast_mail blocks)."""
 
     def __init__(self, n_embd: int, bias: bool = False, dropout: float = 0.0):
         super().__init__()
-        self.c_fc = nn.Linear(n_embd, 4 * n_embd, bias=bias)
-        self.gelu = nn.GELU()
-        self.c_proj = nn.Linear(4 * n_embd, n_embd, bias=bias)
-        self.dropout = nn.Dropout(dropout)
+        self.mlp = nn.Sequential(
+            BESOSwishGLU(n_embd, 4 * n_embd),
+            nn.Linear(4 * n_embd, n_embd, bias=bias),
+            nn.Dropout(dropout),
+        )
 
     def forward(self, x: Tensor) -> Tensor:
-        x = self.c_fc(x)
-        x = self.gelu(x)
-        x = self.c_proj(x)
-        x = self.dropout(x)
-        return x
+        return self.mlp(x)
 
 
 class BESOBlock(nn.Module):
-    """Transformer block with optional cross-attention."""
+    """Transformer block with RMSNorm, SwishGLU MLP, QK-norm attention."""
 
-    def __init__(self, n_embd: int, n_heads: int, attn_pdrop: float, resid_pdrop: float, mlp_pdrop: float, block_size: int, causal: bool, use_cross_attention: bool = False, bias: bool = False):
+    def __init__(self, n_embd: int, n_heads: int, attn_pdrop: float, resid_pdrop: float,
+                 mlp_pdrop: float, block_size: int = 100, causal: bool = True,
+                 use_cross_attention: bool = False, bias: bool = False, qk_norm: bool = True):
         super().__init__()
-        self.ln_1 = BESOLayerNorm(n_embd, bias=bias)
-        self.attn = BESOAttention(n_embd, n_heads, attn_pdrop, resid_pdrop, block_size, causal, bias)
+        self.ln_1 = BESORMSNorm(n_embd, eps=1e-6)
+        self.attn = BESOAttention(n_embd, n_heads, attn_pdrop, resid_pdrop, block_size, causal, bias, qk_norm)
         self.use_cross_attention = use_cross_attention
         if self.use_cross_attention:
-            self.cross_att = BESOAttention(n_embd, n_heads, attn_pdrop, resid_pdrop, block_size, causal, bias)
-            self.ln3 = nn.LayerNorm(n_embd)
-        self.ln_2 = BESOLayerNorm(n_embd, bias=bias)
+            self.cross_att = BESOAttention(n_embd, n_heads, attn_pdrop, resid_pdrop, block_size, causal, bias, qk_norm)
+            self.ln3 = BESORMSNorm(n_embd, eps=1e-6)
+        self.ln_2 = BESORMSNorm(n_embd, eps=1e-6)
         self.mlp = BESOMLP(n_embd, bias, mlp_pdrop)
 
     def forward(self, x: Tensor, context: Tensor | None = None) -> Tensor:
@@ -397,10 +406,7 @@ class BESOAdaLNZero(nn.Module):
 
     def __init__(self, hidden_size: int):
         super().__init__()
-        self.modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(hidden_size, 6 * hidden_size, bias=True),
-        )
+        self.modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 6 * hidden_size, bias=True))
 
     def forward(self, c: Tensor):
         return self.modulation(c).chunk(6, dim=-1)
@@ -409,9 +415,11 @@ class BESOAdaLNZero(nn.Module):
 class BESOConditionedBlock(BESOBlock):
     """Block with AdaLN-Zero conditioning."""
 
-    def __init__(self, n_embd, n_heads, attn_pdrop, resid_pdrop, mlp_pdrop, block_size, causal, film_cond_dim, use_cross_attention=False, bias=False):
-        super().__init__(n_embd, n_heads, attn_pdrop, resid_pdrop, mlp_pdrop, block_size, causal, use_cross_attention=use_cross_attention, bias=bias)
-        self.adaLN_zero = BESOAdaLNZero(film_cond_dim)
+    def __init__(self, n_embd, n_heads, attn_pdrop, resid_pdrop, mlp_pdrop,
+                 block_size=100, causal=True, use_cross_attention=False, bias=False, qk_norm=True):
+        super().__init__(n_embd, n_heads, attn_pdrop, resid_pdrop, mlp_pdrop, block_size,
+                         causal, use_cross_attention, bias, qk_norm)
+        self.adaLN_zero = BESOAdaLNZero(n_embd)
 
     def forward(self, x: Tensor, c: Tensor, context: Tensor | None = None) -> Tensor:
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_zero(c)
@@ -427,15 +435,18 @@ class BESOConditionedBlock(BESOBlock):
 
 
 class BESOTransformerEncoder(nn.Module):
-    """Transformer encoder (non-causal self-attention)."""
+    """Causal Transformer encoder (matching fast_mail TransformerEncoder)."""
 
-    def __init__(self, embed_dim: int, n_heads: int, attn_pdrop: float, resid_pdrop: float, n_layers: int, block_size: int, bias: bool = False, mlp_pdrop: float = 0.0):
+    def __init__(self, embed_dim: int, n_heads: int, attn_pdrop: float, resid_pdrop: float,
+                 n_layers: int, block_size: int = 100, causal: bool = True, bias: bool = False,
+                 mlp_pdrop: float = 0.0, qk_norm: bool = True):
         super().__init__()
         self.blocks = nn.ModuleList([
-            BESOBlock(embed_dim, n_heads, attn_pdrop, resid_pdrop, mlp_pdrop, block_size, causal=False, bias=bias)
+            BESOBlock(embed_dim, n_heads, attn_pdrop, resid_pdrop, mlp_pdrop, block_size,
+                      causal=causal, bias=bias, qk_norm=qk_norm)
             for _ in range(n_layers)
         ])
-        self.ln = BESOLayerNorm(embed_dim, bias)
+        self.ln = BESORMSNorm(embed_dim, eps=1e-6)
 
     def forward(self, x: Tensor) -> Tensor:
         for layer in self.blocks:
@@ -444,41 +455,23 @@ class BESOTransformerEncoder(nn.Module):
         return x
 
 
-class BESOTransformerFiLMDecoder(nn.Module):
-    """Transformer decoder with AdaLN-Zero FiLM conditioning and cross-attention."""
+class BESOTransformerFiLMEncoder(nn.Module):
+    """Causal Transformer encoder with AdaLN-Zero FiLM conditioning."""
 
-    def __init__(self, embed_dim: int, n_heads: int, attn_pdrop: float, resid_pdrop: float, n_layers: int, block_size: int, film_cond_dim: int, bias: bool = False, mlp_pdrop: float = 0.0, use_cross_attention: bool = True):
+    def __init__(self, embed_dim: int, n_heads: int, attn_pdrop: float, resid_pdrop: float,
+                 n_layers: int, block_size: int = 100, causal: bool = True, bias: bool = False,
+                 mlp_pdrop: float = 0.0, qk_norm: bool = True):
         super().__init__()
         self.blocks = nn.ModuleList([
-            BESOConditionedBlock(
-                embed_dim, n_heads, attn_pdrop, resid_pdrop, mlp_pdrop, block_size,
-                causal=True, use_cross_attention=use_cross_attention, bias=bias, film_cond_dim=film_cond_dim,
-            )
+            BESOConditionedBlock(embed_dim, n_heads, attn_pdrop, resid_pdrop, mlp_pdrop, block_size,
+                                 causal=causal, bias=bias, qk_norm=qk_norm)
             for _ in range(n_layers)
         ])
-        self.ln = BESOLayerNorm(embed_dim, bias)
+        self.ln = BESORMSNorm(embed_dim, eps=1e-6)
 
-    def forward(self, x: Tensor, c: Tensor, cond: Tensor | None = None) -> Tensor:
+    def forward(self, x: Tensor, c: Tensor) -> Tensor:
         for layer in self.blocks:
-            x = layer(x, c, cond)
-        x = self.ln(x)
-        return x
-
-
-class BESOTransformerDecoder(nn.Module):
-    """Standard transformer decoder with cross-attention (no FiLM)."""
-
-    def __init__(self, embed_dim: int, n_heads: int, attn_pdrop: float, resid_pdrop: float, n_layers: int, block_size: int, bias: bool = False, mlp_pdrop: float = 0.0, use_cross_attention: bool = True):
-        super().__init__()
-        self.blocks = nn.ModuleList([
-            BESOBlock(embed_dim, n_heads, attn_pdrop, resid_pdrop, mlp_pdrop, block_size, causal=True, use_cross_attention=use_cross_attention, bias=bias)
-            for _ in range(n_layers)
-        ])
-        self.ln = BESOLayerNorm(embed_dim, bias)
-
-    def forward(self, x: Tensor, cond: Tensor | None = None) -> Tensor:
-        for layer in self.blocks:
-            x = layer(x, cond)
+            x = layer(x, c)
         x = self.ln(x)
         return x
 
@@ -500,15 +493,18 @@ class BESOSinusoidalPosEmb(nn.Module):
         return emb
 
 
-# ==================== MDT Transformer (Inner Model) ====================
+# ==================== Inner Model (encoder-only, matching fast_mail Noise_Dec_only) ====================
 
 
-class MDTTransformer(nn.Module):
-    """Masked Diffusion Transformer for score prediction.
+class BESOInnerModel(nn.Module):
+    """Encoder-only diffusion model, matching fast_mail's Noise_Dec_only architecture.
 
-    Encoder-decoder architecture where:
-    - Encoder processes goal + observation tokens
-    - Decoder takes noisy action tokens with sigma conditioning and cross-attends to encoder output
+    Concatenates [sigma_token, goal_tokens, state_tokens, action_tokens] into a single
+    sequence and processes via a causal TransformerEncoder. Extracts last action_seq_len
+    tokens as predicted actions.
+
+    Position embeddings: always applied to goal+action tokens. Applied to observation
+    tokens only when use_pos_emb=True (default: False, matching real_robot config).
     """
 
     def __init__(
@@ -521,8 +517,7 @@ class MDTTransformer(nn.Module):
         attn_pdrop: float,
         resid_pdrop: float,
         mlp_pdrop: float,
-        n_dec_layers: int,
-        n_enc_layers: int,
+        n_layers: int,
         n_heads: int,
         goal_seq_len: int,
         obs_seq_len: int,
@@ -530,8 +525,8 @@ class MDTTransformer(nn.Module):
         goal_drop: float = 0.1,
         bias: bool = False,
         linear_output: bool = True,
-        use_ada_conditioning: bool = True,
-        use_noise_encoder: bool = False,
+        use_ada_conditioning: bool = False,
+        use_pos_emb: bool = False,
     ):
         super().__init__()
         self.obs_dim = obs_dim
@@ -541,20 +536,27 @@ class MDTTransformer(nn.Module):
         self.obs_seq_len = obs_seq_len
         self.action_seq_len = action_seq_len
         self.use_ada_conditioning = use_ada_conditioning
+        self.use_pos_emb = use_pos_emb
 
-        block_size = goal_seq_len + action_seq_len + obs_seq_len + 1
-        seq_size = goal_seq_len + action_seq_len + obs_seq_len
+        seq_size = goal_seq_len + obs_seq_len + action_seq_len
+        block_size = seq_size + 1  # +1 for sigma token
 
-        # Embeddings
+        # Token embeddings
         self.tok_emb = nn.Linear(obs_dim, embed_dim)
-        self.pos_emb = nn.Parameter(torch.zeros(1, seq_size, embed_dim))
+        self.goal_emb = nn.Linear(goal_dim, embed_dim)
+        self.action_emb = nn.Linear(action_dim, embed_dim)
         self.drop = nn.Dropout(embed_pdrop)
         self.cond_mask_prob = goal_drop
 
-        self.goal_emb = nn.Linear(goal_dim, embed_dim)
-        self.action_emb = nn.Linear(action_dim, embed_dim)
+        # Position embeddings (matching fast_mail):
+        # use_pos_emb=True  → pos_emb covers (goal + obs + action)
+        # use_pos_emb=False → pos_emb only covers (goal + action)
+        if use_pos_emb:
+            self.pos_emb = nn.Parameter(torch.zeros(1, seq_size, embed_dim))
+        else:
+            self.pos_emb = nn.Parameter(torch.zeros(1, goal_seq_len + action_seq_len, embed_dim))
 
-        # Sigma embedding
+        # Sigma embedding (BESO-style: log/4 → sinusoidal → MLP → 1 token)
         self.sigma_emb = nn.Sequential(
             BESOSinusoidalPosEmb(embed_dim),
             nn.Linear(embed_dim, embed_dim * 2),
@@ -562,24 +564,18 @@ class MDTTransformer(nn.Module):
             nn.Linear(embed_dim * 2, embed_dim),
         )
 
-        # Encoder
-        self.encoder = BESOTransformerEncoder(
-            embed_dim=embed_dim, n_heads=n_heads, attn_pdrop=attn_pdrop,
-            resid_pdrop=resid_pdrop, n_layers=n_enc_layers, block_size=block_size, bias=bias, mlp_pdrop=mlp_pdrop,
-        )
-
-        # Decoder
+        # Single causal TransformerEncoder (not encoder+decoder!)
         if use_ada_conditioning:
-            self.decoder = BESOTransformerFiLMDecoder(
+            self.encoder = BESOTransformerFiLMEncoder(
                 embed_dim=embed_dim, n_heads=n_heads, attn_pdrop=attn_pdrop,
-                resid_pdrop=resid_pdrop, n_layers=n_dec_layers, block_size=block_size,
-                film_cond_dim=embed_dim, bias=bias, mlp_pdrop=mlp_pdrop, use_cross_attention=True,
+                resid_pdrop=resid_pdrop, n_layers=n_layers, block_size=block_size,
+                causal=True, bias=bias, mlp_pdrop=mlp_pdrop, qk_norm=True,
             )
         else:
-            self.decoder = BESOTransformerDecoder(
+            self.encoder = BESOTransformerEncoder(
                 embed_dim=embed_dim, n_heads=n_heads, attn_pdrop=attn_pdrop,
-                resid_pdrop=resid_pdrop, n_layers=n_dec_layers, block_size=block_size,
-                bias=bias, mlp_pdrop=mlp_pdrop, use_cross_attention=True,
+                resid_pdrop=resid_pdrop, n_layers=n_layers, block_size=block_size,
+                causal=True, bias=bias, mlp_pdrop=mlp_pdrop, qk_norm=True,
             )
 
         # Output head
@@ -587,7 +583,7 @@ class MDTTransformer(nn.Module):
             self.action_pred = nn.Linear(embed_dim, action_dim)
         else:
             self.action_pred = nn.Sequential(
-                nn.Linear(embed_dim, embed_dim), nn.GELU(), nn.Linear(embed_dim, action_dim)
+                nn.Linear(embed_dim, 100), nn.GELU(), nn.Linear(100, action_dim)
             )
 
         self.apply(self._init_weights)
@@ -600,41 +596,47 @@ class MDTTransformer(nn.Module):
         elif isinstance(module, nn.LayerNorm):
             torch.nn.init.zeros_(module.bias)
             torch.nn.init.ones_(module.weight)
-        elif isinstance(module, MDTTransformer):
+        elif isinstance(module, BESOInnerModel):
             torch.nn.init.normal_(module.pos_emb, mean=0.0, std=0.02)
 
     def forward(self, states: Tensor, actions: Tensor, goals: Tensor, sigma: Tensor) -> Tensor:
         b, t, dim = states.size()
         _, t_a, _ = actions.size()
-        _, t_g, _ = goals.size()
 
-        # Embeddings
-        state_embed = self.tok_emb(states)
-        action_embed = self.action_emb(actions)
+        # Embed goal tokens + positional embedding
         goal_embed = self.goal_emb(goals)
+        goal_embed = goal_embed + self.pos_emb[:, :self.goal_seq_len, :]
+        goal_x = self.drop(goal_embed)
 
-        # Position embeddings
-        goal_x = self.drop(goal_embed + self.pos_emb[:, :t_g, :])
-        state_x = self.drop(state_embed + self.pos_emb[:, t_g : (t_g + t), :])
-        action_x = self.drop(action_embed + self.pos_emb[:, (t_g + t) : (t + t_g + t_a), :])
+        # Embed action tokens + positional embedding
+        action_embed = self.action_emb(actions)
+        action_embed = action_embed + self.pos_emb[:, self.goal_seq_len:(self.goal_seq_len + t_a), :]
+        action_x = self.drop(action_embed)
 
-        # Encode context (goal + state)
-        context = self.encoder(torch.cat([goal_x, state_x], dim=1))
+        # Embed observation tokens (pos_emb only if use_pos_emb=True)
+        state_embed = self.tok_emb(states)
+        if self.use_pos_emb:
+            state_embed = state_embed + self.pos_emb[:, (self.goal_seq_len + t_a):(self.goal_seq_len + t_a + t), :]
+        state_x = self.drop(state_embed)
 
-        # Sigma embedding
+        # Sigma embedding → 1 token
         sigmas = sigma.log() / 4
         sigmas = einops.rearrange(sigmas, "b -> b 1")
         emb_t = self.sigma_emb(sigmas)
         if len(emb_t.shape) == 2:
             emb_t = einops.rearrange(emb_t, "b d -> b 1 d")
 
-        # Decode
-        if self.use_ada_conditioning:
-            x = self.decoder(action_x, emb_t, context)
-        else:
-            x = self.decoder(action_x, context)
+        # Concatenate: [sigma, goal, state, action] — matching fast_mail token order
+        input_seq = torch.cat([emb_t, goal_x, state_x, action_x], dim=1)
 
-        pred_actions = self.action_pred(x)
+        # Run through single causal encoder
+        if self.use_ada_conditioning:
+            encoder_output = self.encoder(input_seq, emb_t)
+        else:
+            encoder_output = self.encoder(input_seq)
+
+        # Extract last action_seq_len tokens → action prediction
+        pred_actions = self.action_pred(encoder_output[:, -self.action_seq_len:, :])
         return pred_actions
 
 
@@ -642,11 +644,7 @@ class MDTTransformer(nn.Module):
 
 
 class GCDenoiser(nn.Module):
-    """Karras et al. preconditioner for denoising diffusion models.
-
-    Wraps the inner model (MDTTransformer) with c_skip, c_out, c_in scalings
-    to improve training stability across noise levels.
-    """
+    """Karras et al. preconditioner wrapping the inner model with c_skip, c_out, c_in scalings."""
 
     def __init__(self, inner_model: nn.Module, sigma_data: float = 1.0):
         super().__init__()
@@ -681,14 +679,12 @@ class BESOSpatialSoftmax(nn.Module):
         super().__init__()
         assert len(input_shape) == 3
         self._in_c, self._in_h, self._in_w = input_shape
-
         if num_kp is not None:
             self.nets = nn.Conv2d(self._in_c, num_kp, kernel_size=1)
             self._out_c = num_kp
         else:
             self.nets = None
             self._out_c = self._in_c
-
         pos_x, pos_y = np.meshgrid(np.linspace(-1.0, 1.0, self._in_w), np.linspace(-1.0, 1.0, self._in_h))
         pos_x = torch.from_numpy(pos_x.reshape(self._in_h * self._in_w, 1)).float()
         pos_y = torch.from_numpy(pos_y.reshape(self._in_h * self._in_w, 1)).float()
@@ -705,7 +701,7 @@ class BESOSpatialSoftmax(nn.Module):
 
 
 class BESORgbEncoder(nn.Module):
-    """Encodes an RGB image into a 1D feature vector using a ResNet backbone + SpatialSoftmax."""
+    """Encodes an RGB image into a 1D feature vector using ResNet + SpatialSoftmax."""
 
     def __init__(self, config: BESOConfig):
         super().__init__()
@@ -713,7 +709,6 @@ class BESORgbEncoder(nn.Module):
             self.resize = torchvision.transforms.Resize(config.resize_shape)
         else:
             self.resize = None
-
         crop_shape = config.crop_shape
         if crop_shape is not None:
             self.do_crop = True
@@ -724,7 +719,6 @@ class BESORgbEncoder(nn.Module):
                 self.maybe_random_crop = self.center_crop
         else:
             self.do_crop = False
-
         backbone_model = getattr(torchvision.models, config.vision_backbone)(
             weights=config.pretrained_backbone_weights
         )
@@ -737,7 +731,6 @@ class BESORgbEncoder(nn.Module):
                 predicate=lambda x: isinstance(x, nn.BatchNorm2d),
                 func=lambda x: nn.GroupNorm(num_groups=x.num_features // 16, num_channels=x.num_features),
             )
-
         images_shape = next(iter(config.image_features.values())).shape
         if config.crop_shape is not None:
             dummy_shape_h_w = config.crop_shape
@@ -747,7 +740,6 @@ class BESORgbEncoder(nn.Module):
             dummy_shape_h_w = images_shape[1:]
         dummy_shape = (1, images_shape[0], *dummy_shape_h_w)
         feature_map_shape = get_output_shape(self.backbone, dummy_shape)[1:]
-
         self.pool = BESOSpatialSoftmax(feature_map_shape, num_kp=config.spatial_softmax_num_keypoints)
         self.feature_dim = config.spatial_softmax_num_keypoints * 2
         self.out = nn.Linear(config.spatial_softmax_num_keypoints * 2, self.feature_dim)
@@ -792,7 +784,7 @@ def _replace_submodules(root_module, predicate, func):
 
 
 class BESOModel(nn.Module):
-    """Core BESO model: image encoding + GCDenoiser (MDTTransformer) + EDM sampling."""
+    """Core BESO model: image encoding + GCDenoiser (BESOInnerModel) + EDM sampling."""
 
     def __init__(self, config: BESOConfig):
         super().__init__()
@@ -830,14 +822,12 @@ class BESOModel(nn.Module):
         action_dim = config.action_feature.shape[0]
 
         # Compute the actual observation sequence length that _encode_observations produces.
-        # Visual/env features produce n_obs_steps tokens, and if robot_state_feature is present
-        # it gets concatenated as additional tokens (also n_obs_steps), so total can be 2*n_obs_steps.
         obs_seq_len = config.n_obs_steps
         if config.robot_state_feature:
             obs_seq_len += config.n_obs_steps
 
-        # Inner model: MDTTransformer
-        inner_model = MDTTransformer(
+        # Inner model: encoder-only architecture (matching fast_mail Noise_Dec_only)
+        inner_model = BESOInnerModel(
             obs_dim=config.embed_dim,
             goal_dim=config.goal_dim,
             action_dim=action_dim,
@@ -846,8 +836,7 @@ class BESOModel(nn.Module):
             attn_pdrop=config.attn_pdrop,
             resid_pdrop=config.resid_pdrop,
             mlp_pdrop=config.mlp_pdrop,
-            n_dec_layers=config.n_dec_layers,
-            n_enc_layers=config.n_enc_layers,
+            n_layers=config.n_enc_layers,  # single encoder uses n_enc_layers
             n_heads=config.n_heads,
             goal_seq_len=config.goal_seq_len,
             obs_seq_len=obs_seq_len,
@@ -856,7 +845,7 @@ class BESOModel(nn.Module):
             bias=False,
             linear_output=config.linear_output,
             use_ada_conditioning=config.use_ada_conditioning,
-            use_noise_encoder=config.use_noise_encoder,
+            use_pos_emb=False,  # matching real_robot config: use_pos_emb=False
         )
 
         # Wrap with Karras EDM preconditioner
@@ -901,7 +890,7 @@ class BESOModel(nn.Module):
 
         # Concatenate visual features
         if features_list:
-            obs_features = torch.cat(features_list, dim=-1)  # (B, n_obs_steps, obs_dim)
+            obs_features = torch.cat(features_list, dim=-1)
             if self.obs_proj is not None:
                 obs_features = self.obs_proj(obs_features)
         else:
@@ -909,8 +898,8 @@ class BESOModel(nn.Module):
 
         # Add state embedding as extra tokens
         if self._has_state:
-            state_tokens = self.state_emb(batch[OBS_STATE])  # (B, n_obs_steps, embed_dim)
-            obs_features = torch.cat([obs_features, state_tokens], dim=1)  # (B, 2*n_obs_steps, embed_dim)
+            state_tokens = self.state_emb(batch[OBS_STATE])
+            obs_features = torch.cat([obs_features, state_tokens], dim=1)
 
         return obs_features
 
@@ -951,51 +940,27 @@ class BESOModel(nn.Module):
         """Generate actions via iterative denoising."""
         device = get_device_from_parameters(self)
         dtype = get_dtype_from_parameters(self)
-
         perceptual_emb = self._encode_observations(batch)
         batch_size = perceptual_emb.shape[0]
-
-        # For now, use a zero goal embedding (can be extended for language conditioning)
         goal = torch.zeros(batch_size, self.config.goal_seq_len, self.config.goal_dim, device=device, dtype=dtype)
-
-        # Sample initial noise
         x = torch.randn(batch_size, self.horizon, self.action_dim, device=device, dtype=dtype) * self.sigma_max
-
-        # Get noise schedule
         sigmas = self._get_noise_schedule(self.num_sampling_steps)
-
-        # Run sampler
         sampler_fn = SAMPLERS.get(self.sampler_type)
         if sampler_fn is None:
             raise ValueError(f"Unknown sampler type: {self.sampler_type}")
         actions = sampler_fn(self.denoiser, perceptual_emb, x, goal, sigmas)
-
         return actions
 
     def compute_loss(self, batch: dict[str, Tensor]) -> Tensor:
         """Compute EDM score matching loss."""
         device = get_device_from_parameters(self)
-
         perceptual_emb = self._encode_observations(batch)
         actions = batch[ACTION]
         batch_size = actions.shape[0]
-
-        # Zero goal for now
         goal = torch.zeros(batch_size, self.config.goal_seq_len, self.config.goal_dim, device=device, dtype=actions.dtype)
-
-        # Sample noise levels
         sigmas = self._make_sample_density()(shape=(batch_size,), device=device).to(device)
         noise = torch.randn_like(actions)
-
-        # Compute score matching loss
         loss, _ = self.denoiser.loss(perceptual_emb, actions, goal, noise, sigmas)
-
-        # Mask loss for padded actions
-        if self.config.do_mask_loss_for_padding and "action_is_pad" in batch:
-            in_episode_bound = ~batch["action_is_pad"]
-            # loss is already reduced, so we don't need per-element masking here
-            # The loss from GCDenoiser.loss is already a scalar mean
-
         return loss
 
 
@@ -1005,7 +970,7 @@ class BESOModel(nn.Module):
 class BESOPolicy(PreTrainedPolicy):
     """BESO Policy: BEhavior generation with Score-based diffusiOn.
 
-    Uses EDM-style score matching diffusion with an MDT Transformer backbone.
+    Uses EDM-style score matching diffusion with an encoder-only Transformer backbone.
     """
 
     config_class = BESOConfig
@@ -1015,7 +980,6 @@ class BESOPolicy(PreTrainedPolicy):
         super().__init__(config)
         config.validate_features()
         self.config = config
-
         self._queues = None
         self.beso = BESOModel(config)
         self.reset()
@@ -1036,32 +1000,26 @@ class BESOPolicy(PreTrainedPolicy):
 
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
-        """Predict a chunk of actions given environment observations."""
         batch = {k: torch.stack(list(self._queues[k]), dim=1) for k in batch if k in self._queues}
         actions = self.beso.generate_actions(batch)
         return actions
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
-        """Select a single action given environment observations."""
         if ACTION in batch:
             batch.pop(ACTION)
-
         if self.config.image_features:
             batch = dict(batch)
             batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
-
         self._queues = populate_queues(self._queues, batch)
-
         if len(self._queues[ACTION]) == 0:
             actions = self.predict_action_chunk(batch, noise=noise)
             self._queues[ACTION].extend(actions.transpose(0, 1))
-
         action = self._queues[ACTION].popleft()
         return action
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, None]:
-        """Run the batch through the model and compute the loss for training or validation."""
+        """Run the batch through the model and compute the loss for training."""
         if self.config.image_features:
             batch = dict(batch)
             for key in self.config.image_features:
