@@ -29,6 +29,7 @@ from lerobot.datasets.feature_utils import dataset_to_policy_features
 from lerobot.envs.configs import EnvConfig
 from lerobot.envs.utils import env_to_policy_features
 from lerobot.policies.act.configuration_act import ACTConfig
+from lerobot.policies.beso.configuration_beso import BESOConfig
 from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
 from lerobot.policies.groot.configuration_groot import GrootConfig
 from lerobot.policies.pi0.configuration_pi0 import PI0Config
@@ -79,6 +80,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from lerobot.policies.tdmpc.modeling_tdmpc import TDMPCPolicy
 
         return TDMPCPolicy
+    elif name == "beso":
+        from lerobot.policies.beso.modeling_beso import BESOPolicy
+
+        return BESOPolicy
     elif name == "diffusion":
         from lerobot.policies.diffusion.modeling_diffusion import DiffusionPolicy
 
@@ -159,6 +164,8 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
     """
     if policy_type == "tdmpc":
         return TDMPCConfig(**kwargs)
+    elif policy_type == "beso":
+        return BESOConfig(**kwargs)
     elif policy_type == "diffusion":
         return DiffusionConfig(**kwargs)
     elif policy_type == "act":
@@ -289,6 +296,14 @@ def make_pre_post_processors(
         from lerobot.policies.tdmpc.processor_tdmpc import make_tdmpc_pre_post_processors
 
         processors = make_tdmpc_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+
+    elif isinstance(policy_cfg, BESOConfig):
+        from lerobot.policies.beso.processor_beso import make_beso_pre_post_processors
+
+        processors = make_beso_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
         )
