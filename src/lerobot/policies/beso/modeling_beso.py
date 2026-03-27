@@ -1,11 +1,3 @@
-"""BESO Policy: BEhavior generation with Score-based diffusiOn.
-
-Implements the BESO policy using EDM-style (Karras et al. 2022) score matching diffusion
-with an encoder-only Transformer backbone (matching fast_mail's Noise_Dec_only architecture).
-
-Ported from the fast_mail implementation to follow lerobot's policy patterns.
-"""
-
 import math
 from collections import deque
 from functools import partial
@@ -291,12 +283,9 @@ NOISE_SCHEDULES = {
 }
 
 
-# ==================== Transformer Components (matching fast_mail) ====================
 
 
 class BESORMSNorm(nn.Module):
-    """RMSNorm — better, simpler alternative to LayerNorm (matching fast_mail blocks)."""
-
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.scale = dim ** -0.5
@@ -309,7 +298,6 @@ class BESORMSNorm(nn.Module):
 
 
 class BESOSwishGLU(nn.Module):
-    """Gated Linear Unit with Swish activation (matching fast_mail blocks)."""
 
     def __init__(self, in_dim: int, out_dim: int):
         super().__init__()
@@ -365,7 +353,6 @@ class BESOAttention(nn.Module):
 
 
 class BESOMLP(nn.Module):
-    """SwishGLU MLP (matching fast_mail blocks)."""
 
     def __init__(self, n_embd: int, bias: bool = False, dropout: float = 0.0):
         super().__init__()
@@ -437,7 +424,6 @@ class BESOConditionedBlock(BESOBlock):
 
 
 class BESOTransformerEncoder(nn.Module):
-    """Causal Transformer encoder (matching fast_mail TransformerEncoder)."""
 
     def __init__(self, embed_dim: int, n_heads: int, attn_pdrop: float, resid_pdrop: float,
                  n_layers: int, block_size: int = 100, causal: bool = True, bias: bool = False,
@@ -495,19 +481,8 @@ class BESOSinusoidalPosEmb(nn.Module):
         return emb
 
 
-# ==================== Inner Model (encoder-only, matching fast_mail Noise_Dec_only) ====================
-
 
 class BESOInnerModel(nn.Module):
-    """Encoder-only diffusion model, matching fast_mail's Noise_Dec_only architecture.
-
-    Concatenates [sigma_token, goal_tokens, state_tokens, action_tokens] into a single
-    sequence and processes via a causal TransformerEncoder. Extracts last action_seq_len
-    tokens as predicted actions.
-
-    Position embeddings: always applied to goal+action tokens. Applied to observation
-    tokens only when use_pos_emb=True (default: False, matching real_robot config).
-    """
 
     def __init__(
         self,
@@ -550,15 +525,11 @@ class BESOInnerModel(nn.Module):
         self.drop = nn.Dropout(embed_pdrop)
         self.cond_mask_prob = goal_drop
 
-        # Position embeddings (matching fast_mail):
-        # use_pos_emb=True  → pos_emb covers (goal + obs + action)
-        # use_pos_emb=False → pos_emb only covers (goal + action)
         if use_pos_emb:
             self.pos_emb = nn.Parameter(torch.zeros(1, seq_size, embed_dim))
         else:
             self.pos_emb = nn.Parameter(torch.zeros(1, goal_seq_len + action_seq_len, embed_dim))
 
-        # Sigma embedding (BESO-style: log/4 → sinusoidal → MLP → 1 token)
         self.sigma_emb = nn.Sequential(
             BESOSinusoidalPosEmb(embed_dim),
             nn.Linear(embed_dim, embed_dim * 2),
@@ -628,7 +599,6 @@ class BESOInnerModel(nn.Module):
         if len(emb_t.shape) == 2:
             emb_t = einops.rearrange(emb_t, "b d -> b 1 d")
 
-        # Concatenate: [sigma, goal, state, action] — matching fast_mail token order
         input_seq = torch.cat([emb_t, goal_x, state_x, action_x], dim=1)
 
         # Run through single causal encoder
@@ -786,11 +756,6 @@ def _replace_submodules(root_module, predicate, func):
 
 
 class BESOLanguageEncoder(nn.Module):
-    """CLIP-based language encoder for goal conditioning.
-
-    Uses HuggingFace CLIPTextModel to encode text instructions into goal embeddings.
-    Weights are frozen by default (matching fast_mail's LangClip).
-    """
 
     def __init__(self, clip_model_name: str = "openai/clip-vit-base-patch32", goal_dim: int = 512, freeze: bool = True):
         super().__init__()
@@ -881,7 +846,6 @@ class BESOModel(nn.Module):
         if config.robot_state_feature:
             obs_seq_len += config.n_obs_steps
 
-        # Inner model: encoder-only architecture (matching fast_mail Noise_Dec_only)
         inner_model = BESOInnerModel(
             obs_dim=config.embed_dim,
             goal_dim=config.goal_dim,
