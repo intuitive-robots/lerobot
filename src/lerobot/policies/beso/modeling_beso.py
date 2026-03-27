@@ -27,7 +27,9 @@ from lerobot.policies.utils import (
     get_output_shape,
     populate_queues,
 )
-from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
+from lerobot.utils.constants import (
+    ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS, OBS_STATE,
+)
 
 
 # ==================== Noise / Sigma Utilities ====================
@@ -783,8 +785,50 @@ def _replace_submodules(root_module, predicate, func):
 # ==================== BESO Model ====================
 
 
+class BESOLanguageEncoder(nn.Module):
+    """CLIP-based language encoder for goal conditioning.
+
+    Uses HuggingFace CLIPTextModel to encode text instructions into goal embeddings.
+    Weights are frozen by default (matching fast_mail's LangClip).
+    """
+
+    def __init__(self, clip_model_name: str = "openai/clip-vit-base-patch32", goal_dim: int = 512, freeze: bool = True):
+        super().__init__()
+        from transformers import CLIPTextModel  # lazy import to avoid hard dependency
+
+        self.clip_text = CLIPTextModel.from_pretrained(clip_model_name)
+        clip_dim = self.clip_text.config.hidden_size  # 512 for ViT-B/32
+
+        if clip_dim != goal_dim:
+            self.proj = nn.Linear(clip_dim, goal_dim)
+        else:
+            self.proj = None
+
+        if freeze:
+            for param in self.clip_text.parameters():
+                param.requires_grad = False
+
+    @torch.no_grad()
+    def forward(self, input_ids: Tensor, attention_mask: Tensor | None = None) -> Tensor:
+        """Encode text tokens into goal embedding.
+
+        Args:
+            input_ids: (B, seq_len) tokenized text
+            attention_mask: (B, seq_len) attention mask
+
+        Returns:
+            (B, 1, goal_dim) goal embedding
+        """
+        outputs = self.clip_text(input_ids=input_ids, attention_mask=attention_mask)
+        # Use the pooled output (CLS token) — shape (B, clip_dim)
+        emb = outputs.pooler_output.float()
+        if self.proj is not None:
+            emb = self.proj(emb)
+        return emb.unsqueeze(1)  # (B, 1, goal_dim)
+
+
 class BESOModel(nn.Module):
-    """Core BESO model: image encoding + GCDenoiser (BESOInnerModel) + EDM sampling."""
+    """Core BESO model: image encoding + CLIP goal conditioning + GCDenoiser + EDM sampling."""
 
     def __init__(self, config: BESOConfig):
         super().__init__()
@@ -817,6 +861,17 @@ class BESOModel(nn.Module):
             self.obs_proj = nn.Linear(obs_dim, config.embed_dim)
         else:
             self.obs_proj = None
+
+        # Language encoder for goal conditioning
+        if config.use_language_conditioning:
+            self.language_encoder = BESOLanguageEncoder(
+                clip_model_name=config.clip_model_name,
+                goal_dim=config.goal_dim,
+                freeze=config.freeze_clip,
+            )
+            self._has_language = True
+        else:
+            self._has_language = False
 
         # Action dimension
         action_dim = config.action_feature.shape[0]
@@ -936,13 +991,25 @@ class BESOModel(nn.Module):
         else:
             return schedule_fn(n_steps, device=device)
 
+    def _encode_goal(self, batch: dict[str, Tensor], batch_size: int, device, dtype) -> Tensor:
+        """Encode goal from language instruction or return zeros."""
+        if self._has_language and OBS_LANGUAGE_TOKENS in batch:
+            goal = self.language_encoder(
+                input_ids=batch[OBS_LANGUAGE_TOKENS],
+                attention_mask=batch.get(OBS_LANGUAGE_ATTENTION_MASK),
+            ).to(dtype)
+        else:
+            goal = torch.zeros(batch_size, self.config.goal_seq_len, self.config.goal_dim,
+                               device=device, dtype=dtype)
+        return goal
+
     def generate_actions(self, batch: dict[str, Tensor]) -> Tensor:
         """Generate actions via iterative denoising."""
         device = get_device_from_parameters(self)
         dtype = get_dtype_from_parameters(self)
         perceptual_emb = self._encode_observations(batch)
         batch_size = perceptual_emb.shape[0]
-        goal = torch.zeros(batch_size, self.config.goal_seq_len, self.config.goal_dim, device=device, dtype=dtype)
+        goal = self._encode_goal(batch, batch_size, device, dtype)
         x = torch.randn(batch_size, self.horizon, self.action_dim, device=device, dtype=dtype) * self.sigma_max
         sigmas = self._get_noise_schedule(self.num_sampling_steps)
         sampler_fn = SAMPLERS.get(self.sampler_type)
@@ -957,7 +1024,7 @@ class BESOModel(nn.Module):
         perceptual_emb = self._encode_observations(batch)
         actions = batch[ACTION]
         batch_size = actions.shape[0]
-        goal = torch.zeros(batch_size, self.config.goal_seq_len, self.config.goal_dim, device=device, dtype=actions.dtype)
+        goal = self._encode_goal(batch, batch_size, device, actions.dtype)
         sigmas = self._make_sample_density()(shape=(batch_size,), device=device).to(device)
         noise = torch.randn_like(actions)
         loss, _ = self.denoiser.loss(perceptual_emb, actions, goal, noise, sigmas)

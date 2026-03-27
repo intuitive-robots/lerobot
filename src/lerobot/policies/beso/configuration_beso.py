@@ -58,6 +58,11 @@ class BESOConfig(PreTrainedConfig):
     use_noise_encoder: bool = False
     linear_output: bool = True
 
+    # Language conditioning (CLIP)
+    use_language_conditioning: bool = False
+    clip_model_name: str = "openai/clip-vit-base-patch32"
+    freeze_clip: bool = True
+
     # EDM Diffusion
     sampler_type: str = "ddim"
     num_sampling_steps: int = 4
