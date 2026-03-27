@@ -1,11 +1,3 @@
-"""BESO Policy: BEhavior generation with Score-based diffusiOn.
-
-Implements the BESO policy using EDM-style (Karras et al. 2022) score matching diffusion
-with an MDT Transformer backbone for visuomotor policy learning.
-
-Ported from the fast_mail implementation to follow lerobot's policy patterns.
-"""
-
 import math
 from collections import deque
 from functools import partial

@@ -15,59 +15,6 @@ from lerobot.optim.schedulers import DiffuserSchedulerConfig
 @PreTrainedConfig.register_subclass("beso")
 @dataclass
 class BESOConfig(PreTrainedConfig):
-    """Configuration class for BESOPolicy.
-
-    Defaults are configured for training with proprioceptive and single camera observations.
-
-    Notes on the inputs and outputs:
-        - "observation.state" is required as an input key.
-        - At least one key starting with "observation.image" is required as an input.
-        - "action" is required as an output key.
-
-    Args:
-        n_obs_steps: Number of observation steps to use.
-        horizon: Number of action steps to predict (action_seq_len).
-        n_action_steps: Number of action steps to execute per policy call.
-
-        # Vision backbone
-        vision_backbone: Name of torchvision ResNet backbone.
-        resize_shape: (H, W) to resize images to before encoding.
-        crop_ratio: Ratio for deriving crop_shape from resize_shape.
-        crop_shape: (H, W) to crop images to.
-        crop_is_random: Whether to use random crop during training.
-        pretrained_backbone_weights: Pretrained weights for vision backbone.
-        use_group_norm: Replace BatchNorm with GroupNorm in backbone.
-        spatial_softmax_num_keypoints: Number of keypoints for SpatialSoftmax.
-        use_separate_rgb_encoder_per_camera: Use a separate encoder per camera.
-
-        # MDT Transformer
-        embed_dim: Transformer embedding dimension.
-        n_enc_layers: Number of encoder layers.
-        n_dec_layers: Number of decoder layers.
-        n_heads: Number of attention heads.
-        embed_pdrop: Embedding dropout.
-        attn_pdrop: Attention dropout.
-        resid_pdrop: Residual dropout.
-        mlp_pdrop: MLP dropout.
-        goal_dim: Dimension of goal/language embedding.
-        goal_seq_len: Sequence length of goal tokens.
-        goal_drop: Goal conditioning dropout rate (for classifier-free guidance).
-        use_ada_conditioning: Use AdaLN-Zero conditioning in decoder.
-        use_noise_encoder: Use noise encoder blocks in decoder.
-        linear_output: Use linear output layer vs MLP.
-
-        # EDM Diffusion
-        sampler_type: Sampling method for inference (ddim, euler, heun, etc.).
-        num_sampling_steps: Number of denoising steps at inference.
-        sigma_data: Data standard deviation for EDM preconditioner.
-        sigma_min: Minimum noise level.
-        sigma_max: Maximum noise level.
-        noise_scheduler: Noise schedule type (exponential, karras, etc.).
-        sigma_sample_density_type: Training noise density (loglogistic, lognormal, etc.).
-
-        # Loss
-        do_mask_loss_for_padding: Whether to mask loss for padded actions.
-    """
 
     # Inputs / output structure
     n_obs_steps: int = 1
