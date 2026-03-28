@@ -975,8 +975,6 @@ class BESOModel(nn.Module):
                 attention_mask=batch.get(OBS_LANGUAGE_ATTENTION_MASK),
             ).to(dtype)
         elif self._has_language and "task" in batch:
-            print("Nutze String")
-            # Tokenize raw task strings on-the-fly
             task_strings = batch["task"]
             if isinstance(task_strings, str):
                 task_strings = [task_strings]
