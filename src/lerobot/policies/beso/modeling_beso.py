@@ -759,9 +759,10 @@ class BESOLanguageEncoder(nn.Module):
 
     def __init__(self, clip_model_name: str = "openai/clip-vit-base-patch32", goal_dim: int = 512, freeze: bool = True):
         super().__init__()
-        from transformers import CLIPTextModel  # lazy import to avoid hard dependency
+        from transformers import CLIPTextModel, AutoTokenizer  # lazy import to avoid hard dependency
 
         self.clip_text = CLIPTextModel.from_pretrained(clip_model_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(clip_model_name)
         clip_dim = self.clip_text.config.hidden_size  # 512 for ViT-B/32
 
         if clip_dim != goal_dim:
@@ -772,6 +773,11 @@ class BESOLanguageEncoder(nn.Module):
         if freeze:
             for param in self.clip_text.parameters():
                 param.requires_grad = False
+
+    def tokenize(self, texts: list[str], device: torch.device) -> dict[str, Tensor]:
+        """Tokenize a list of strings and move to device."""
+        encoded = self.tokenizer(texts, padding=True, truncation=True, return_tensors="pt")
+        return {k: v.to(device) for k, v in encoded.items()}
 
     @torch.no_grad()
     def forward(self, input_ids: Tensor, attention_mask: Tensor | None = None) -> Tensor:
@@ -956,11 +962,28 @@ class BESOModel(nn.Module):
             return schedule_fn(n_steps, device=device)
 
     def _encode_goal(self, batch: dict[str, Tensor], batch_size: int, device, dtype) -> Tensor:
-        """Encode goal from language instruction or return zeros."""
+        """Encode goal from language instruction or return zeros.
+
+        Supports three modes:
+        1. Pre-tokenized: OBS_LANGUAGE_TOKENS already in batch
+        2. Raw task strings: "task" key contains list of strings (tokenized on-the-fly via CLIP)
+        3. No language: returns zero goal embedding
+        """
         if self._has_language and OBS_LANGUAGE_TOKENS in batch:
             goal = self.language_encoder(
                 input_ids=batch[OBS_LANGUAGE_TOKENS],
                 attention_mask=batch.get(OBS_LANGUAGE_ATTENTION_MASK),
+            ).to(dtype)
+        elif self._has_language and "task" in batch:
+            print("Nutze String")
+            # Tokenize raw task strings on-the-fly
+            task_strings = batch["task"]
+            if isinstance(task_strings, str):
+                task_strings = [task_strings]
+            tokenized = self.language_encoder.tokenize(task_strings, device)
+            goal = self.language_encoder(
+                input_ids=tokenized["input_ids"],
+                attention_mask=tokenized.get("attention_mask"),
             ).to(dtype)
         else:
             goal = torch.zeros(batch_size, self.config.goal_seq_len, self.config.goal_dim,

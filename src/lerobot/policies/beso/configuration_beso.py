@@ -59,7 +59,7 @@ class BESOConfig(PreTrainedConfig):
     linear_output: bool = True
 
     # Language conditioning (CLIP)
-    use_language_conditioning: bool = False
+    use_language_conditioning: bool = True
     clip_model_name: str = "openai/clip-vit-base-patch32"
     freeze_clip: bool = True
 
