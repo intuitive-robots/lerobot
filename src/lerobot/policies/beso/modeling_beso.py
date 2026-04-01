@@ -1052,8 +1052,11 @@ class BESOPolicy(PreTrainedPolicy):
 
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
-        batch = {k: torch.stack(list(self._queues[k]), dim=1) for k in batch if k in self._queues}
-        actions = self.beso.generate_actions(batch)
+        language_keys = [k for k in (OBS_LANGUAGE_TOKENS, OBS_LANGUAGE_ATTENTION_MASK, "task") if k in batch]
+        queued = {k: torch.stack(list(self._queues[k]), dim=1) for k in batch if k in self._queues}
+        for k in language_keys:
+            queued[k] = batch[k]
+        actions = self.beso.generate_actions(queued)
         return actions
 
     @torch.no_grad()
