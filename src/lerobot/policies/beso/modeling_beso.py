@@ -1,3 +1,4 @@
+import copy
 import math
 from collections import deque
 from functools import partial
@@ -673,7 +674,12 @@ class BESOSpatialSoftmax(nn.Module):
 
 
 class BESORgbEncoder(nn.Module):
-    """Encodes an RGB image into a 1D feature vector using ResNet + SpatialSoftmax."""
+    """Encodes an RGB image into a 1D feature vector.
+
+    Two pooling modes:
+    - "spatial_softmax": ResNet feature map → SpatialSoftmax → 2*num_kp features.
+    - "avgpool":        ResNet → global avgpool → Linear(backbone_dim → vision_feature_dim).
+    """
 
     def __init__(self, config: BESOConfig):
         super().__init__()
@@ -691,10 +697,18 @@ class BESORgbEncoder(nn.Module):
                 self.maybe_random_crop = self.center_crop
         else:
             self.do_crop = False
+
         backbone_model = getattr(torchvision.models, config.vision_backbone)(
             weights=config.pretrained_backbone_weights
         )
-        self.backbone = nn.Sequential(*(list(backbone_model.children())[:-2]))
+        self.pool_mode = config.vision_pool_mode
+
+        if self.pool_mode == "spatial_softmax":
+            self.backbone = nn.Sequential(*(list(backbone_model.children())[:-2]))
+        else:
+            # Keep the global avgpool; drop only the classifier fc.
+            self.backbone = nn.Sequential(*(list(backbone_model.children())[:-1]))
+
         if config.use_group_norm:
             # Replace BatchNorm with GroupNorm for deterministic normalization.
             # This is done even with pretrained weights (pretrained BN params are discarded).
@@ -703,6 +717,7 @@ class BESORgbEncoder(nn.Module):
                 predicate=lambda x: isinstance(x, nn.BatchNorm2d),
                 func=lambda x: nn.GroupNorm(num_groups=x.num_features // 16, num_channels=x.num_features),
             )
+
         images_shape = next(iter(config.image_features.values())).shape
         if config.crop_shape is not None:
             dummy_shape_h_w = config.crop_shape
@@ -711,11 +726,21 @@ class BESORgbEncoder(nn.Module):
         else:
             dummy_shape_h_w = images_shape[1:]
         dummy_shape = (1, images_shape[0], *dummy_shape_h_w)
-        feature_map_shape = get_output_shape(self.backbone, dummy_shape)[1:]
-        self.pool = BESOSpatialSoftmax(feature_map_shape, num_kp=config.spatial_softmax_num_keypoints)
-        self.feature_dim = config.spatial_softmax_num_keypoints * 2
-        self.out = nn.Linear(config.spatial_softmax_num_keypoints * 2, self.feature_dim)
-        self.relu = nn.ReLU()
+
+        if self.pool_mode == "spatial_softmax":
+            feature_map_shape = get_output_shape(self.backbone, dummy_shape)[1:]
+            self.pool = BESOSpatialSoftmax(feature_map_shape, num_kp=config.spatial_softmax_num_keypoints)
+            self.feature_dim = config.spatial_softmax_num_keypoints * 2
+            self.out = nn.Linear(config.spatial_softmax_num_keypoints * 2, self.feature_dim)
+            self.relu = nn.ReLU()
+        else:
+            # Backbone already ends with avgpool → (B, C, 1, 1). Infer C from a dummy pass.
+            with torch.no_grad():
+                backbone_out_dim = self.backbone(torch.zeros(dummy_shape)).shape[1]
+            self.pool = None
+            self.feature_dim = config.vision_feature_dim
+            self.out = nn.Linear(backbone_out_dim, self.feature_dim)
+            self.relu = None
 
     def forward(self, x: Tensor) -> Tensor:
         if self.resize is not None:
@@ -725,8 +750,13 @@ class BESORgbEncoder(nn.Module):
                 x = self.maybe_random_crop(x)
             else:
                 x = self.center_crop(x)
-        x = torch.flatten(self.pool(self.backbone(x)), start_dim=1)
-        x = self.relu(self.out(x))
+        x = self.backbone(x)
+        if self.pool_mode == "spatial_softmax":
+            x = torch.flatten(self.pool(x), start_dim=1)
+            x = self.relu(self.out(x))
+        else:
+            x = torch.flatten(x, start_dim=1)
+            x = self.out(x)
         return x
 
 
@@ -759,7 +789,7 @@ class BESOLanguageEncoder(nn.Module):
 
     def __init__(self, clip_model_name: str = "openai/clip-vit-base-patch32", goal_dim: int = 512, freeze: bool = True):
         super().__init__()
-        from transformers import CLIPTextModel, AutoTokenizer  # lazy import to avoid hard dependency
+        from transformers import CLIPTextModel, AutoTokenizer
 
         self.clip_text = CLIPTextModel.from_pretrained(clip_model_name)
         self.tokenizer = AutoTokenizer.from_pretrained(clip_model_name)
@@ -806,18 +836,21 @@ class BESOModel(nn.Module):
         self.config = config
 
         # Build observation encoders
+        self.num_cameras = len(config.image_features) if config.image_features else 0
+        self.per_cam_tokens = bool(config.obs_tokens_per_camera and config.image_features)
         obs_dim = 0
+        per_cam_feature_dim = 0
         if config.image_features:
-            num_images = len(config.image_features)
             if config.use_separate_rgb_encoder_per_camera:
-                encoders = [BESORgbEncoder(config) for _ in range(num_images)]
+                encoders = [BESORgbEncoder(config) for _ in range(self.num_cameras)]
                 self.rgb_encoder = nn.ModuleList(encoders)
-                obs_dim += encoders[0].feature_dim * num_images
+                per_cam_feature_dim = encoders[0].feature_dim
             else:
                 self.rgb_encoder = BESORgbEncoder(config)
-                obs_dim += self.rgb_encoder.feature_dim * num_images
+                per_cam_feature_dim = self.rgb_encoder.feature_dim
+            obs_dim += per_cam_feature_dim * self.num_cameras
 
-        if config.robot_state_feature:
+        if config.robot_state_feature and config.use_robot_state:
             state_dim = config.robot_state_feature.shape[0]
             self.state_emb = nn.Linear(state_dim, config.embed_dim)
             self._has_state = True
@@ -827,11 +860,27 @@ class BESOModel(nn.Module):
         if config.env_state_feature:
             obs_dim += config.env_state_feature.shape[0]
 
-        # If obs_dim doesn't match embed_dim, project it
-        if obs_dim != config.embed_dim and obs_dim > 0:
-            self.obs_proj = nn.Linear(obs_dim, config.embed_dim)
-        else:
+        if self.per_cam_tokens:
+            if config.env_state_feature:
+                raise NotImplementedError(
+                    "env_state_feature is not supported with obs_tokens_per_camera=True. "
+                    "Disable obs_tokens_per_camera or drop env_state_feature."
+                )
+            # Each camera produces one token at embed_dim. If the per-camera feature dim
+            # already matches embed_dim (e.g. avgpool mode with vision_feature_dim=embed_dim),
+            # the projection is a no-op.
+            if per_cam_feature_dim != config.embed_dim:
+                self.cam_proj = nn.Linear(per_cam_feature_dim, config.embed_dim)
+            else:
+                self.cam_proj = None
             self.obs_proj = None
+        else:
+            # Single obs token per step: concatenate all camera features (+ env_state) and project.
+            if obs_dim != config.embed_dim and obs_dim > 0:
+                self.obs_proj = nn.Linear(obs_dim, config.embed_dim)
+            else:
+                self.obs_proj = None
+            self.cam_proj = None
 
         # Language encoder for goal conditioning
         if config.use_language_conditioning:
@@ -848,8 +897,13 @@ class BESOModel(nn.Module):
         action_dim = config.action_feature.shape[0]
 
         # Compute the actual observation sequence length that _encode_observations produces.
-        obs_seq_len = config.n_obs_steps
-        if config.robot_state_feature:
+        if self.per_cam_tokens:
+            obs_seq_len = config.n_obs_steps * self.num_cameras
+        elif config.image_features or config.env_state_feature:
+            obs_seq_len = config.n_obs_steps
+        else:
+            obs_seq_len = 0
+        if self._has_state:
             obs_seq_len += config.n_obs_steps
 
         inner_model = BESOInnerModel(
@@ -889,37 +943,74 @@ class BESOModel(nn.Module):
 
     def _encode_observations(self, batch: dict[str, Tensor]) -> Tensor:
         """Encode observations into a sequence of tokens."""
-        batch_size, n_obs_steps = batch[OBS_STATE].shape[:2]
-        features_list = []
+        # Pick any available observation key to determine batch layout — OBS_STATE may be absent
+        # when training image-only (use_robot_state=False and no robot_state in the dataset).
+        if OBS_IMAGES in batch:
+            batch_size, n_obs_steps = batch[OBS_IMAGES].shape[:2]
+        elif OBS_STATE in batch:
+            batch_size, n_obs_steps = batch[OBS_STATE].shape[:2]
+        elif OBS_ENV_STATE in batch:
+            batch_size, n_obs_steps = batch[OBS_ENV_STATE].shape[:2]
+        else:
+            raise ValueError("No observation key found in batch.")
 
-        # Encode images
-        if self.config.image_features:
+        if self.per_cam_tokens:
+            # Per-camera tokens: (B, S*N, embed_dim), each camera is its own token.
             if self.config.use_separate_rgb_encoder_per_camera:
                 images_per_camera = einops.rearrange(batch[OBS_IMAGES], "b s n ... -> n (b s) ...")
-                img_features = torch.cat([
-                    encoder(images)
-                    for encoder, images in zip(self.rgb_encoder, images_per_camera, strict=True)
-                ])
-                img_features = einops.rearrange(img_features, "(n b s) ... -> b s (n ...)", b=batch_size, s=n_obs_steps)
+                per_cam = [
+                    enc(imgs) for enc, imgs in zip(self.rgb_encoder, images_per_camera, strict=True)
+                ]
+                # Each element: (b*s, feat) → stack to (b, s, n, feat)
+                per_cam = [
+                    einops.rearrange(e, "(b s) f -> b s f", b=batch_size, s=n_obs_steps)
+                    for e in per_cam
+                ]
+                cam_feats = torch.stack(per_cam, dim=2)
             else:
-                img_features = self.rgb_encoder(
+                flat = self.rgb_encoder(
                     einops.rearrange(batch[OBS_IMAGES], "b s n ... -> (b s n) ...")
                 )
-                img_features = einops.rearrange(
-                    img_features, "(b s n) ... -> b s (n ...)", b=batch_size, s=n_obs_steps
+                cam_feats = einops.rearrange(
+                    flat, "(b s n) f -> b s n f", b=batch_size, s=n_obs_steps, n=self.num_cameras
                 )
-            features_list.append(img_features)
-
-        if self.config.env_state_feature:
-            features_list.append(batch[OBS_ENV_STATE])
-
-        # Concatenate visual features
-        if features_list:
-            obs_features = torch.cat(features_list, dim=-1)
-            if self.obs_proj is not None:
-                obs_features = self.obs_proj(obs_features)
+            if self.cam_proj is not None:
+                cam_feats = self.cam_proj(cam_feats)
+            obs_features = einops.rearrange(cam_feats, "b s n f -> b (s n) f")
         else:
-            obs_features = torch.zeros(batch_size, n_obs_steps, self.config.embed_dim, device=batch[OBS_STATE].device)
+            # Single obs token per step (original lerobot behavior).
+            features_list = []
+            if self.config.image_features:
+                if self.config.use_separate_rgb_encoder_per_camera:
+                    images_per_camera = einops.rearrange(batch[OBS_IMAGES], "b s n ... -> n (b s) ...")
+                    img_features = torch.cat([
+                        encoder(images)
+                        for encoder, images in zip(self.rgb_encoder, images_per_camera, strict=True)
+                    ])
+                    img_features = einops.rearrange(
+                        img_features, "(n b s) ... -> b s (n ...)", b=batch_size, s=n_obs_steps
+                    )
+                else:
+                    img_features = self.rgb_encoder(
+                        einops.rearrange(batch[OBS_IMAGES], "b s n ... -> (b s n) ...")
+                    )
+                    img_features = einops.rearrange(
+                        img_features, "(b s n) ... -> b s (n ...)", b=batch_size, s=n_obs_steps
+                    )
+                features_list.append(img_features)
+
+            if self.config.env_state_feature:
+                features_list.append(batch[OBS_ENV_STATE])
+
+            if features_list:
+                obs_features = torch.cat(features_list, dim=-1)
+                if self.obs_proj is not None:
+                    obs_features = self.obs_proj(obs_features)
+            else:
+                any_obs = next(iter(batch.values()))
+                obs_features = torch.zeros(
+                    batch_size, n_obs_steps, self.config.embed_dim, device=any_obs.device
+                )
 
         # Add state embedding as extra tokens
         if self._has_state:
@@ -1034,10 +1125,39 @@ class BESOPolicy(PreTrainedPolicy):
         self.config = config
         self._queues = None
         self.beso = BESOModel(config)
+        # EMA shadow of the full BESO model (encoder + denoiser + language). Used at inference.
+        if getattr(config, "use_ema", False):
+            self.beso_ema = copy.deepcopy(self.beso)
+            for p in self.beso_ema.parameters():
+                p.requires_grad_(False)
+            self.beso_ema.eval()
+        else:
+            self.beso_ema = None
         self.reset()
 
     def get_optim_params(self) -> dict:
         return self.beso.parameters()
+
+    def train(self, mode: bool = True):
+        # Keep the EMA shadow in eval mode regardless of the policy's train/eval state.
+        super().train(mode)
+        if self.beso_ema is not None:
+            self.beso_ema.eval()
+        return self
+
+    @torch.no_grad()
+    def update(self):
+        """Hook called by the training loop after each optimizer step to update the EMA shadow."""
+        if self.beso_ema is None:
+            return
+        decay = self.config.ema_decay
+        for ema_p, p in zip(self.beso_ema.parameters(), self.beso.parameters(), strict=True):
+            ema_p.mul_(decay).add_(p.detach().to(ema_p.dtype), alpha=1.0 - decay)
+        for ema_b, b in zip(self.beso_ema.buffers(), self.beso.buffers(), strict=True):
+            ema_b.copy_(b)
+
+    def _inference_model(self) -> "BESOModel":
+        return self.beso_ema if self.beso_ema is not None else self.beso
 
     def reset(self):
         """Clear observation and action queues."""
@@ -1056,7 +1176,7 @@ class BESOPolicy(PreTrainedPolicy):
         queued = {k: torch.stack(list(self._queues[k]), dim=1) for k in batch if k in self._queues}
         for k in language_keys:
             queued[k] = batch[k]
-        actions = self.beso.generate_actions(queued)
+        actions = self._inference_model().generate_actions(queued)
         return actions
 
     @torch.no_grad()

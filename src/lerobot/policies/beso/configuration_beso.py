@@ -39,8 +39,19 @@ class BESOConfig(PreTrainedConfig):
     crop_is_random: bool = False
     pretrained_backbone_weights: str | None = "ResNet18_Weights.IMAGENET1K_V1"
     use_group_norm: bool = True
+    # "spatial_softmax": ResNet feature map → SpatialSoftmax → 2*num_kp features.
+    # "avgpool":        ResNet → global avgpool → Linear(backbone_dim → vision_feature_dim).
+    vision_pool_mode: str = "avgpool"
     spatial_softmax_num_keypoints: int = 32
+    vision_feature_dim: int = 512
     use_separate_rgb_encoder_per_camera: bool = True
+    # If True, each camera (and each obs step) is fed to the transformer as its own token at
+    # embed_dim. If False, camera features are concatenated along the feature axis and projected
+    # into a single obs token per step.
+    obs_tokens_per_camera: bool = True
+    # If False, the robot_state feature is ignored even when present in the dataset — no state
+    # tokens are added to the transformer input. Set to False to train image-only.
+    use_robot_state: bool = False
 
     # MDT Transformer
     embed_dim: int = 512
@@ -75,6 +86,10 @@ class BESOConfig(PreTrainedConfig):
     # Loss
     do_mask_loss_for_padding: bool = False
 
+    # EMA — exponential moving average of the full model used at inference time.
+    use_ema: bool = True
+    ema_decay: float = 0.995
+
     # Training presets
     optimizer_lr: float = 1e-4
     optimizer_betas: tuple = (0.9, 0.9)
@@ -89,6 +104,11 @@ class BESOConfig(PreTrainedConfig):
         if not self.vision_backbone.startswith("resnet"):
             raise ValueError(
                 f"`vision_backbone` must be one of the ResNet variants. Got {self.vision_backbone}."
+            )
+
+        if self.vision_pool_mode not in ("spatial_softmax", "avgpool"):
+            raise ValueError(
+                f"`vision_pool_mode` must be 'spatial_softmax' or 'avgpool'. Got {self.vision_pool_mode}."
             )
 
         if self.resize_shape is not None and (
